@@ -61,7 +61,7 @@ def get_paper_references(arxiv_id: str) -> list[dict]:
             "references.authors,references.year"
         )
     }
-    api_key = "s2k-fhi5EdmH06mXnzCKBfYjEjp4VByMKDjoj71G5t8v"
+    api_key = API_KEY
     headers = {"x-api-key": api_key}
     
     max_retries = 10
@@ -80,13 +80,13 @@ def get_paper_references(arxiv_id: str) -> list[dict]:
         time.sleep(INTERVAL)
         return response.json().get("references") or []
         
-    print(f"[Lỗi] Bỏ qua paper {arxiv_id} vì dính lỗi 429 liên tục.")
+    print(f"Skipping {arxiv_id} persistent 429.")
     return None
 
 
 def get_source(
     arxiv_id: str,
-    save_dir: str | Path = "./sources",
+    save_dir: str | Path = "./sourcesArxiv",
     paper=None,
     references: list | None = None,
 ) -> dict:
