@@ -1,5 +1,10 @@
 .venv
 .env
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+sourcesArxiv/
+sourcesOAI/
 .jpg
 .png
 .mp4
