@@ -1,5 +1,6 @@
 .venv
 .env
+.vscode
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
@@ -8,3 +9,4 @@ sourcesOAI/
 .jpg
 .png
 .mp4
+.gitignore
