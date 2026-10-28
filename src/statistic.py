@@ -1,8 +1,9 @@
 """Module thống kê dữ liệu cào bài báo arXiv phục vụ báo cáo Jupyter Book.
 
-Tập trung vào 2 chỉ số cốt lõi theo yêu cầu của đồ án:
+Tập trung vào 3 nhóm chỉ số cốt lõi theo yêu cầu của đồ án:
 1. Kích thước trung bình (bytes) của bài báo trước và sau khi loại bỏ hình ảnh.
 2. Số lượng references trung bình mỗi bài, tỉ lệ crawl metadata references thành công.
+3. Đánh giá hiệu năng thực nghiệm (Performance Benchmarking): Thời gian chạy, RAM và Dung lượng lưu trữ.
 Hỗ trợ so sánh trực tiếp giữa 2 phương pháp: arxiv_crawler vs oai_crawler.
 """
 
@@ -30,6 +31,8 @@ plt.rcParams.update({
 
 def format_table(df: pd.DataFrame):
     """Định dạng bảng căn lề trái toàn bộ nội dung (trừ cột index)."""
+    if not isinstance(df, pd.DataFrame):
+        return df
     if df.empty:
         return df
     try:
@@ -403,3 +406,443 @@ def plot_side_by_side_size(df_arxiv: pd.DataFrame, df_oai: pd.DataFrame) -> plt.
 
     plt.tight_layout()
     return fig
+
+
+# --------------------------------------------------------------------------- #
+# Yêu cầu 3: Đánh giá Hiệu năng (Scraper's Performance Benchmarking)
+# --------------------------------------------------------------------------- #
+def load_benchmark_data(
+    results_csv: str | Path = "benchmark_results.csv",
+    timeseries_csv: str | Path = "benchmark_timeseries.csv",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Đọc dữ liệu hiệu năng từ file benchmark_results.csv và benchmark_timeseries.csv."""
+    res_path = Path(results_csv)
+    if not res_path.exists():
+        for candidate in [Path("src") / res_path.name, Path("..") / res_path.name, Path(__file__).parent / res_path.name]:
+            if candidate.exists():
+                res_path = candidate
+                break
+
+    ts_path = Path(timeseries_csv)
+    if not ts_path.exists():
+        for candidate in [Path("src") / ts_path.name, Path("..") / ts_path.name, Path(__file__).parent / ts_path.name]:
+            if candidate.exists():
+                ts_path = candidate
+                break
+
+    bench_df = pd.read_csv(res_path) if res_path.exists() else pd.DataFrame()
+    ts_df = pd.read_csv(ts_path) if ts_path.exists() else pd.DataFrame()
+    return bench_df, ts_df
+
+
+def _find_crawler_row(benchmark_df: pd.DataFrame, crawler_name: str) -> pd.Series | None:
+    if benchmark_df.empty or "crawler" not in benchmark_df.columns:
+        return None
+    norm = crawler_name.strip().lower()
+    matched = benchmark_df[benchmark_df["crawler"].str.lower() == norm]
+    if matched.empty:
+        matched = benchmark_df[benchmark_df["crawler"].str.lower().str.contains(norm)]
+    if matched.empty:
+        return None
+    return matched.iloc[-1]
+
+
+def compute_performance_stats(benchmark_df: pd.DataFrame, crawler_name: str) -> pd.DataFrame:
+    """Tạo bảng thống kê chi tiết Thời gian chạy và Bộ nhớ & Lưu trữ cho 1 crawler."""
+    row = _find_crawler_row(benchmark_df, crawler_name)
+    if row is None:
+        return pd.DataFrame()
+
+    papers = int(row.get("papers_crawled", 50))
+    versions = int(row.get("versions_crawled", 0))
+    wall_sec = float(row.get("total_wall_time_sec", 0.0))
+    disc_sec = float(row.get("discovery_time_sec", 0.0))
+    disc_pct = (disc_sec / wall_sec * 100.0) if wall_sec > 0 else 0.0
+    avg_sec = float(row.get("avg_paper_time_sec", 0.0))
+    med_sec = float(row.get("median_paper_time_sec", 0.0))
+    min_sec = float(row.get("min_paper_time_sec", 0.0))
+    max_sec = float(row.get("max_paper_time_sec", 0.0))
+
+    base_ram = float(row.get("baseline_ram_mb", 0.0))
+    avg_ram = float(row.get("avg_ram_mb", 0.0))
+    peak_ram = float(row.get("peak_ram_mb", 0.0))
+    overhead_ram = float(row.get("ram_overhead_mb", max(0.0, peak_ram - base_ram)))
+
+    raw_bytes = int(row.get("raw_archive_bytes", 0))
+    uncomp_bytes = int(row.get("total_uncompressed_bytes", 0))
+    max_disk_bytes = int(row.get("max_disk_storage_bytes", 0))
+    final_disk_bytes = int(row.get("final_output_storage_bytes", 0))
+    saving_pct = float(
+        row.get(
+            "storage_saving_pct",
+            (1.0 - final_disk_bytes / uncomp_bytes) * 100.0 if uncomp_bytes > 0 else 0.0,
+        )
+    )
+
+    stats_dict = {
+        "Nhóm tiêu chí": [
+            "Quy mô mẫu",
+            "Thời gian chạy (Running Time)",
+            "Thời gian chạy (Running Time)",
+            "Thời gian chạy (Running Time)",
+            "Thời gian chạy (Running Time)",
+            "Thời gian chạy (Running Time)",
+            "Thời gian chạy (Running Time)",
+            "Bộ nhớ (Memory Footprint)",
+            "Bộ nhớ (Memory Footprint)",
+            "Bộ nhớ (Memory Footprint)",
+            "Lưu trữ (Disk & Storage)",
+            "Lưu trữ (Disk & Storage)",
+            "Lưu trữ (Disk & Storage)",
+            "Lưu trữ (Disk & Storage)",
+            "Lưu trữ (Disk & Storage)",
+        ],
+        "Chỉ số hiệu năng": [
+            "Số bài báo / Tổng số phiên bản cào được",
+            "Tổng thời gian chạy thực tế (Total Wall Time)",
+            "Thời gian khám phá mục bài báo (Discovery Time)",
+            "Thời gian xử lý trung bình mỗi bài (Mean Time/Paper)",
+            "Thời gian xử lý trung vị mỗi bài (Median Time/Paper)",
+            "Thời gian xử lý nhanh nhất 1 bài (Min Time/Paper)",
+            "Thời gian xử lý chậm nhất 1 bài (Max Time/Paper)",
+            "Mức tiêu thụ RAM cơ sở (Baseline RAM)",
+            "Mức tiêu thụ RAM trung bình (Average RAM)",
+            "Mức tiêu thụ RAM đỉnh tối đa (Peak RAM)",
+            "Tổng dung lượng gói nén .tar.gz tải về (raw_archive_bytes)",
+            "Dung lượng giải nén lý thuyết trước lọc (total_uncompressed_bytes)",
+            "Dung lượng đĩa tối đa cần thiết lúc cào (max_disk_storage_bytes)",
+            "Dung lượng đầu ra cuối cùng trên ổ đĩa (final_output_storage_bytes)",
+            "Tỷ lệ tiết kiệm không gian đĩa thực tế so với lý thuyết (%)",
+        ],
+        "Giá trị": [
+            f"{papers:,} bài ({versions:,} phiên bản)",
+            f"{wall_sec:,.2f} giây ({wall_sec / 60.0:,.2f} phút)",
+            f"{disc_sec:,.2f} giây (chiếm {disc_pct:.1f}% tổng thời gian)",
+            f"{avg_sec:,.2f} giây / bài",
+            f"{med_sec:,.2f} giây / bài",
+            f"{min_sec:,.2f} giây",
+            f"{max_sec:,.2f} giây",
+            f"{base_ram:,.2f} MB",
+            f"{avg_ram:,.2f} MB",
+            f"{peak_ram:,.2f} MB (Tăng đỉnh +{overhead_ram:,.2f} MB)",
+            f"{raw_bytes / (1024 * 1024):,.2f} MB ({raw_bytes:,} Bytes)",
+            f"{uncomp_bytes / (1024 * 1024):,.2f} MB ({uncomp_bytes:,} Bytes)",
+            f"{max_disk_bytes / (1024 * 1024):,.2f} MB ({max_disk_bytes:,} Bytes)",
+            f"{final_disk_bytes / (1024 * 1024):,.2f} MB ({final_disk_bytes:,} Bytes)",
+            f"{saving_pct:.2f}%",
+        ],
+    }
+    return pd.DataFrame(stats_dict)
+
+
+def compare_performance_stats(benchmark_df: pd.DataFrame) -> pd.DataFrame:
+    """Tạo bảng so sánh đối chiếu trực diện các chỉ số hiệu năng giữa arxiv_crawler và oai_crawler."""
+    if benchmark_df.empty:
+        return pd.DataFrame()
+
+    row_arxiv = _find_crawler_row(benchmark_df, "arxiv_crawler")
+    row_oai = _find_crawler_row(benchmark_df, "oai_crawler")
+
+    def extract_metrics(row: pd.Series | None) -> list[str]:
+        if row is None:
+            return ["N/A"] * 12
+        papers = int(row.get("papers_crawled", 50))
+        versions = int(row.get("versions_crawled", 0))
+        wall_sec = float(row.get("total_wall_time_sec", 0.0))
+        disc_sec = float(row.get("discovery_time_sec", 0.0))
+        avg_sec = float(row.get("avg_paper_time_sec", 0.0))
+        med_sec = float(row.get("median_paper_time_sec", 0.0))
+        min_sec = float(row.get("min_paper_time_sec", 0.0))
+        max_sec = float(row.get("max_paper_time_sec", 0.0))
+        avg_ram = float(row.get("avg_ram_mb", 0.0))
+        peak_ram = float(row.get("peak_ram_mb", 0.0))
+        raw_mb = float(row.get("raw_archive_bytes", 0)) / (1024 * 1024)
+        uncomp_mb = float(row.get("total_uncompressed_bytes", 0)) / (1024 * 1024)
+        max_disk_mb = float(row.get("max_disk_storage_bytes", 0)) / (1024 * 1024)
+        final_disk_mb = float(row.get("final_output_storage_bytes", 0)) / (1024 * 1024)
+        saving_pct = float(row.get("storage_saving_pct", 0.0))
+
+        return [
+            f"{papers:,} bài ({versions:,} phiên bản)",
+            f"{wall_sec:,.2f} s ({wall_sec / 60.0:,.2f} phút)",
+            f"{disc_sec:,.2f} s",
+            f"{avg_sec:,.2f} s / bài",
+            f"{med_sec:,.2f} s / bài",
+            f"{min_sec:,.2f} s / {max_sec:,.2f} s",
+            f"{avg_ram:,.2f} MB",
+            f"{peak_ram:,.2f} MB",
+            f"{raw_mb:,.2f} MB",
+            f"{uncomp_mb:,.2f} MB",
+            f"{max_disk_mb:,.2f} MB",
+            f"{final_disk_mb:,.2f} MB (Tiết kiệm {saving_pct:.2f}%)",
+        ]
+
+    criteria = [
+        "Số bài báo / Tổng số phiên bản",
+        "Tổng thời gian chạy (Total Wall Time)",
+        "Thời gian khám phá mục bài (Discovery Time)",
+        "Thời gian xử lý trung bình / bài (Mean)",
+        "Thời gian xử lý trung vị / bài (Median)",
+        "Thời gian xử lý Min / Max mỗi bài",
+        "Mức tiêu thụ RAM trung bình (Average RAM)",
+        "Mức tiêu thụ RAM đỉnh tối đa (Peak RAM)",
+        "Tổng dung lượng gói nén gốc (raw_archive_bytes)",
+        "Dung lượng giải nén lý thuyết chưa lọc (total_uncompressed_bytes)",
+        "Dung lượng đĩa tối đa lúc cào (max_disk_storage_bytes)",
+        "Dung lượng đầu ra cuối cùng trên đĩa (final_output_storage_bytes)",
+    ]
+
+    comp_df = pd.DataFrame({
+        "Tiêu chí hiệu năng": criteria,
+        "arXiv API (arxiv_crawler)": extract_metrics(row_arxiv),
+        "OAI-PMH (oai_crawler)": extract_metrics(row_oai),
+    })
+    return comp_df
+
+
+def plot_performance_charts(
+    benchmark_df: pd.DataFrame,
+    timeseries_df: pd.DataFrame | None = None,
+) -> tuple[plt.Figure, plt.Figure, plt.Figure] | None:
+    """Vẽ 3 bộ biểu đồ đánh giá hiệu năng: Thời gian chạy, RAM Footprint và Dung lượng Lưu trữ."""
+    if benchmark_df.empty:
+        print("[Cảnh báo] benchmark_df rỗng, không thể vẽ biểu đồ hiệu năng.")
+        return None
+
+    row_arxiv = _find_crawler_row(benchmark_df, "arxiv_crawler")
+    row_oai = _find_crawler_row(benchmark_df, "oai_crawler")
+    if row_arxiv is None or row_oai is None:
+        print("[Cảnh báo] Cần đủ dữ liệu của cả arxiv_crawler và oai_crawler để vẽ biểu đồ đối sánh.")
+        return None
+
+    # ----------------------------------------------------------------------- #
+    # Biểu đồ 1: So sánh Thời gian chạy (Total Wall Time, Discovery Time, Time/Paper)
+    # ----------------------------------------------------------------------- #
+    fig1, (ax1a, ax1b) = plt.subplots(1, 2, figsize=(14, 5.2))
+
+    macro_labels = ["Tổng thời gian chạy\n(Total Wall Time)", "Thời gian Khám phá\n(Discovery Time)"]
+    arxiv_macro = [float(row_arxiv["total_wall_time_sec"]), float(row_arxiv["discovery_time_sec"])]
+    oai_macro = [float(row_oai["total_wall_time_sec"]), float(row_oai["discovery_time_sec"])]
+
+    x1 = np.arange(len(macro_labels))
+    w1 = 0.34
+    r1_arxiv = ax1a.bar(x1 - w1 / 2, arxiv_macro, w1, label="arXiv API (arxiv_crawler)", color="#0d00ff", alpha=0.90)
+    r1_oai = ax1a.bar(x1 + w1 / 2, oai_macro, w1, label="OAI-PMH (oai_crawler)", color="#ff0000", alpha=0.90)
+
+    ax1a.set_ylabel("Thời gian (Giây)", fontweight="bold")
+    ax1a.set_title("Tổng thời gian chạy & Thời gian Discovery", fontweight="bold", pad=12)
+    ax1a.set_xticks(x1)
+    ax1a.set_xticklabels(macro_labels)
+    ax1a.set_ylim(0, max(arxiv_macro + oai_macro) * 1.18)
+    ax1a.legend(frameon=True)
+
+    for rect in list(r1_arxiv) + list(r1_oai):
+        h = rect.get_height()
+        ax1a.annotate(
+            f"{h:,.1f}s",
+            xy=(rect.get_x() + rect.get_width() / 2, h),
+            xytext=(0, 4),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            fontweight="bold",
+        )
+
+    speedup_pct = (1.0 - arxiv_macro[0] / oai_macro[0]) * 100.0 if oai_macro[0] > 0 else 0.0
+    ax1a.text(
+        0.5,
+        0.90,
+        f"arXiv API nhanh hơn {speedup_pct:.1f}% tổng thời gian nhờ Batch Discovery",
+        transform=ax1a.transAxes,
+        ha="center",
+        va="center",
+        bbox=dict(boxstyle="round,pad=0.5", fc="#ffd42a", ec="none", alpha=0.35),
+        fontweight="bold",
+        fontsize=9.5,
+    )
+
+    paper_labels = ["Trung bình\n(Mean)", "Trung vị\n(Median)", "Nhanh nhất\n(Min)", "Chậm nhất\n(Max)"]
+    arxiv_paper_t = [
+        float(row_arxiv["avg_paper_time_sec"]),
+        float(row_arxiv["median_paper_time_sec"]),
+        float(row_arxiv["min_paper_time_sec"]),
+        float(row_arxiv["max_paper_time_sec"]),
+    ]
+    oai_paper_t = [
+        float(row_oai["avg_paper_time_sec"]),
+        float(row_oai["median_paper_time_sec"]),
+        float(row_oai["min_paper_time_sec"]),
+        float(row_oai["max_paper_time_sec"]),
+    ]
+
+    x2 = np.arange(len(paper_labels))
+    r2_arxiv = ax1b.bar(x2 - w1 / 2, arxiv_paper_t, w1, label="arXiv API (arxiv_crawler)", color="#0d00ff", alpha=0.90)
+    r2_oai = ax1b.bar(x2 + w1 / 2, oai_paper_t, w1, label="OAI-PMH (oai_crawler)", color="#ff0000", alpha=0.90)
+
+    ax1b.set_ylabel("Thời gian xử lý / bài (Giây)", fontweight="bold")
+    ax1b.set_title("Thời gian xử lý trên từng bài báo (S2 + Tải & Giải nén)", fontweight="bold", pad=12)
+    ax1b.set_xticks(x2)
+    ax1b.set_xticklabels(paper_labels)
+    ax1b.set_ylim(0, max(arxiv_paper_t + oai_paper_t) * 1.18)
+    ax1b.legend(frameon=True)
+
+    for rect in list(r2_arxiv) + list(r2_oai):
+        h = rect.get_height()
+        ax1b.annotate(
+            f"{h:,.1f}s",
+            xy=(rect.get_x() + rect.get_width() / 2, h),
+            xytext=(0, 4),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=9.5,
+        )
+
+    fig1.tight_layout()
+
+    # ----------------------------------------------------------------------- #
+    # Biểu đồ 2: Mức tiêu thụ RAM (Peak vs Average RAM & Biến thiên theo thời gian)
+    # ----------------------------------------------------------------------- #
+    fig2, (ax2a, ax2b) = plt.subplots(1, 2, figsize=(14, 5.2))
+
+    ram_labels = ["RAM cơ sở\n(Baseline)", "RAM trung bình\n(Average)", "RAM đỉnh\n(Peak)"]
+    arxiv_ram = [
+        float(row_arxiv.get("baseline_ram_mb", 0.0)),
+        float(row_arxiv["avg_ram_mb"]),
+        float(row_arxiv["peak_ram_mb"]),
+    ]
+    oai_ram = [
+        float(row_oai.get("baseline_ram_mb", 0.0)),
+        float(row_oai["avg_ram_mb"]),
+        float(row_oai["peak_ram_mb"]),
+    ]
+
+    x_ram = np.arange(len(ram_labels))
+    r_ram_arxiv = ax2a.bar(x_ram - w1 / 2, arxiv_ram, w1, label="arXiv API (arxiv_crawler)", color="#0d00ff", alpha=0.90)
+    r_ram_oai = ax2a.bar(x_ram + w1 / 2, oai_ram, w1, label="OAI-PMH (oai_crawler)", color="#ff0000", alpha=0.90)
+
+    ax2a.set_ylabel("Mức tiêu thụ RAM (MB)", fontweight="bold")
+    ax2a.set_title("So sánh mức tiêu thụ Bộ nhớ (Peak RAM vs Average RAM)", fontweight="bold", pad=12)
+    ax2a.set_xticks(x_ram)
+    ax2a.set_xticklabels(ram_labels)
+    ax2a.set_ylim(0, max(arxiv_ram + oai_ram) * 1.20)
+    ax2a.legend(frameon=True)
+
+    for rect in list(r_ram_arxiv) + list(r_ram_oai):
+        h = rect.get_height()
+        ax2a.annotate(
+            f"{h:,.1f} MB",
+            xy=(rect.get_x() + rect.get_width() / 2, h),
+            xytext=(0, 4),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=9.5,
+        )
+
+    if timeseries_df is not None and not timeseries_df.empty and "ram_mb" in timeseries_df.columns:
+        ram_ts = timeseries_df
+        if "record_type" in ram_ts.columns:
+            ram_only = ram_ts[ram_ts["record_type"] == "ram_sample"]
+            if not ram_only.empty:
+                ram_ts = ram_only
+
+        ts_arxiv = ram_ts[ram_ts["crawler"] == "arxiv_crawler"].sort_values("elapsed_sec")
+        ts_oai = ram_ts[ram_ts["crawler"] == "oai_crawler"].sort_values("elapsed_sec")
+
+        if not ts_arxiv.empty:
+            ax2b.plot(
+                ts_arxiv["elapsed_sec"],
+                ts_arxiv["ram_mb"],
+                color="#0d00ff",
+                linewidth=1.8,
+                alpha=0.90,
+                label=f"arXiv API (Peak: {float(row_arxiv['peak_ram_mb']):.1f} MB)",
+            )
+        if not ts_oai.empty:
+            ax2b.plot(
+                ts_oai["elapsed_sec"],
+                ts_oai["ram_mb"],
+                color="#ff0000",
+                linewidth=1.8,
+                alpha=0.85,
+                label=f"OAI-PMH (Peak: {float(row_oai['peak_ram_mb']):.1f} MB)",
+            )
+        ax2b.set_xlabel("Thời gian chạy (Giây)", fontweight="bold")
+        ax2b.set_ylabel("RAM RSS (MB)", fontweight="bold")
+        ax2b.set_title("Biến thiên mức tiêu thụ RAM theo thời gian (Chu kỳ 0.5s)", fontweight="bold", pad=12)
+        ax2b.legend(frameon=True)
+    else:
+        ax2b.set_title("Chưa có dữ liệu chuỗi thời gian RAM (benchmark_timeseries.csv)", fontweight="bold")
+
+    fig2.tight_layout()
+
+    # ----------------------------------------------------------------------- #
+    # Biểu đồ 3: So sánh Dung lượng Lưu trữ (Lý thuyết, Gói nén gốc, Đĩa tối đa, Đầu ra cuối)
+    # ----------------------------------------------------------------------- #
+    fig3, ax3 = plt.subplots(figsize=(12, 5.5))
+
+    storage_labels = [
+        "Dung lượng giải nén lý thuyết\n(Trước khi lọc ảnh)",
+        "Tổng dung lượng gói nén gốc\n(raw_archive_bytes)",
+        "Dung lượng đĩa tối đa lúc cào\n(max_disk_storage_bytes)",
+        "Dung lượng đầu ra cuối cùng\n(final_output_storage_bytes)",
+    ]
+    arxiv_storage_mb = [
+        float(row_arxiv["total_uncompressed_bytes"]) / (1024 * 1024),
+        float(row_arxiv["raw_archive_bytes"]) / (1024 * 1024),
+        float(row_arxiv["max_disk_storage_bytes"]) / (1024 * 1024),
+        float(row_arxiv["final_output_storage_bytes"]) / (1024 * 1024),
+    ]
+    oai_storage_mb = [
+        float(row_oai["total_uncompressed_bytes"]) / (1024 * 1024),
+        float(row_oai["raw_archive_bytes"]) / (1024 * 1024),
+        float(row_oai["max_disk_storage_bytes"]) / (1024 * 1024),
+        float(row_oai["final_output_storage_bytes"]) / (1024 * 1024),
+    ]
+
+    x_st = np.arange(len(storage_labels))
+    w_st = 0.35
+    r_st_arxiv = ax3.bar(x_st - w_st / 2, arxiv_storage_mb, w_st, label="arXiv API (arxiv_crawler)", color="#0d00ff", alpha=0.90)
+    r_st_oai = ax3.bar(x_st + w_st / 2, oai_storage_mb, w_st, label="OAI-PMH (oai_crawler)", color="#ff0000", alpha=0.90)
+
+    ax3.set_ylabel("Dung lượng (MB)", fontweight="bold")
+    ax3.set_title(
+        "So sánh Dung lượng Lưu trữ Lý thuyết, Gói nén gốc (.tar.gz) và Đầu ra Thực tế trên Đĩa",
+        fontweight="bold",
+        pad=12,
+    )
+    ax3.set_xticks(x_st)
+    ax3.set_xticklabels(storage_labels)
+    ax3.set_ylim(0, max(arxiv_storage_mb + oai_storage_mb) * 1.20)
+    ax3.legend(frameon=True)
+
+    for rect in list(r_st_arxiv) + list(r_st_oai):
+        h = rect.get_height()
+        ax3.annotate(
+            f"{h:,.2f} MB",
+            xy=(rect.get_x() + rect.get_width() / 2, h),
+            xytext=(0, 4),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            fontweight="bold",
+        )
+
+    save_arxiv_pct = float(row_arxiv.get("storage_saving_pct", 0.0))
+    save_oai_pct = float(row_oai.get("storage_saving_pct", 0.0))
+    ax3.text(
+        0.5,
+        0.90,
+        f"Tối ưu lưu trữ thực tế trên đĩa: arXiv API giảm {save_arxiv_pct:.1f}% | OAI-PMH giảm {save_oai_pct:.1f}% so với giải nén lý thuyết",
+        transform=ax3.transAxes,
+        ha="center",
+        va="center",
+        bbox=dict(boxstyle="round,pad=0.5", fc="#ffd42a", ec="none", alpha=0.35),
+        fontweight="bold",
+    )
+
+    fig3.tight_layout()
+    return fig1, fig2, fig3
