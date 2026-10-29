@@ -378,7 +378,7 @@ def extract_source_assets(archive_bytes: bytes, version_dir: Path) -> dict:
         out["total_uncompressed_bytes"] = len(data)
     except (OSError, EOFError):
         return out
-    if b"\documentclass" in data or b"\begin{document}" in data:
+    if rb"\documentclass" in data or rb"\begin{document}" in data:
         dest = version_dir / "main.tex"
         dest.write_bytes(data)
         out["filtered_uncompressed_bytes"] = len(data)

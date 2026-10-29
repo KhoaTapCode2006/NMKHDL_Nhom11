@@ -205,7 +205,7 @@ def get_source(
             try:
                 data = gzip.decompress(archive_bytes)
                 total_uncompressed_bytes = len(data)
-                if b"\documentclass" in data or b"\begin{document}" in data:
+                if rb"\documentclass" in data or rb"\begin{document}" in data:
                     output_path = version_dir / "main.tex"
                     output_path.write_bytes(data)
                     tex_files.append("main.tex")
