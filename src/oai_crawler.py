@@ -329,7 +329,12 @@ def extract_source_assets(archive_bytes: bytes, version_dir: Path) -> dict:
     Handles tar(.gz) archives and the single gzipped-file case arXiv uses for
     one-file submissions.
     """
-    out = {"tex_files": [], "bib_files": []}
+    out = {
+        "tex_files": [],
+        "bib_files": [],
+        "total_uncompressed_bytes": 0,
+        "filtered_uncompressed_bytes": 0,
+    }
     if not archive_bytes:
         return out
 
@@ -344,6 +349,8 @@ def extract_source_assets(archive_bytes: bytes, version_dir: Path) -> dict:
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as tar:
             for member in tar.getmembers():
+                if member.isfile():
+                    out["total_uncompressed_bytes"] += member.size
                 if not member.isfile():
                     continue
                 p = _safe_member_path(member.name)
@@ -354,7 +361,9 @@ def extract_source_assets(archive_bytes: bytes, version_dir: Path) -> dict:
                     continue
                 dest = version_dir.joinpath(*p.parts)
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(src.read())
+                content = src.read()
+                dest.write_bytes(content)
+                out["filtered_uncompressed_bytes"] += len(content)
                 record(dest)
         return out
     except tarfile.ReadError:
@@ -363,11 +372,13 @@ def extract_source_assets(archive_bytes: bytes, version_dir: Path) -> dict:
     # Not a tar: maybe a single gzipped .tex file
     try:
         data = gzip.decompress(archive_bytes)
+        out["total_uncompressed_bytes"] = len(data)
     except (OSError, EOFError):
         return out
-    if b"\\documentclass" in data or b"\\begin{document}" in data:
+    if b"\documentclass" in data or b"\begin{document}" in data:
         dest = version_dir / "main.tex"
         dest.write_bytes(data)
+        out["filtered_uncompressed_bytes"] = len(data)
         record(dest)
     return out
 
@@ -407,6 +418,11 @@ def get_source(meta: dict, save_dir: Path, references: list | None) -> dict:
         raise
     has_content = files["tex_files"] or files["bib_files"]
     metadata["source_status"] = "downloaded" if has_content else "no_tex_or_bib"
+    metadata["raw_archive_bytes"] = len(archive_bytes) if archive_bytes else 0
+    metadata["total_uncompressed_bytes"] = files.get("total_uncompressed_bytes", 0)
+    metadata["filtered_uncompressed_bytes"] = files.get("filtered_uncompressed_bytes", 0)
+    metadata["references_status"] = "success" if isinstance(references, list) else "failed"
+    metadata["references_count"] = len(references) if isinstance(references, list) else 0
     metadata["tex_files"] = files["tex_files"]
     metadata["bib_files"] = files["bib_files"]
     save_json(metadata, metadata_path)

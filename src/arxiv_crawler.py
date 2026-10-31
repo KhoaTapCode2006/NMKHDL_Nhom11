@@ -1,5 +1,6 @@
 import arxiv
 import json
+import gzip
 import io
 import tarfile
 import time
@@ -16,7 +17,7 @@ load_dotenv()
 API_KEY = os.getenv("API_KEY")
 YEAR_MONTH = "2510"  
 START_SEQ = 10788
-END_SEQ = 10795
+END_SEQ = 10837
 INTERVAL = 3.1
 
 all_target_ids = [f"{YEAR_MONTH}.{seq:05d}" for seq in range(START_SEQ, END_SEQ + 1)]
@@ -106,6 +107,22 @@ def get_source(
     version_dir.mkdir(parents=True, exist_ok=True)
 
     metadata_path = version_dir / "metadata.json"
+
+    # Resume support: skip versions that were fully downloaded earlier
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                saved_meta = json.load(f)
+            if saved_meta.get("source_status") in {"downloaded", "no_tex_or_bib"}:
+                print(f"  {versioned_arxiv_id}: skipped (da tai truoc do)")
+                return {
+                    "paper_dir": str(paper_dir),
+                    "version_dir": str(version_dir),
+                    "source_status": "skipped",
+                }
+        except (json.JSONDecodeError, OSError):
+            pass
+
     metadata = build_paper_metadata(paper, versioned_arxiv_id)
     metadata["source_status"] = "downloading"
     save_json_file(metadata, metadata_path)
@@ -145,6 +162,10 @@ def get_source(
 
     tex_files = []
     bib_files = []
+    total_uncompressed_bytes = 0
+    filtered_uncompressed_bytes = 0
+    raw_archive_bytes = len(archive_bytes) if archive_bytes else 0
+
     if archive_bytes:
         try:
             archive = tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*")
@@ -154,6 +175,8 @@ def get_source(
         if archive is not None:
             with archive:
                 for member in archive.getmembers():
+                    if member.isfile():
+                        total_uncompressed_bytes += member.size
                     member_path = PurePosixPath(member.name)
                     if (
                         not member.isfile()
@@ -167,14 +190,32 @@ def get_source(
                     if source_file is None:
                         continue
 
+                    content = source_file.read()
+                    filtered_uncompressed_bytes += len(content)
                     output_path = version_dir.joinpath(*member_path.parts)
                     output_path.parent.mkdir(parents=True, exist_ok=True)
-                    output_path.write_bytes(source_file.read())
+                    output_path.write_bytes(content)
                     if member_path.suffix.lower() == ".tex":
                         tex_files.append(str(output_path.relative_to(version_dir)))
                     else:
                         bib_files.append(str(output_path.relative_to(version_dir)))
+        else:
+            try:
+                data = gzip.decompress(archive_bytes)
+                total_uncompressed_bytes = len(data)
+                if b"\documentclass" in data or b"\begin{document}" in data:
+                    output_path = version_dir / "main.tex"
+                    output_path.write_bytes(data)
+                    tex_files.append("main.tex")
+                    filtered_uncompressed_bytes = len(data)
+            except Exception:
+                pass
 
+    metadata["raw_archive_bytes"] = raw_archive_bytes
+    metadata["total_uncompressed_bytes"] = total_uncompressed_bytes
+    metadata["filtered_uncompressed_bytes"] = filtered_uncompressed_bytes
+    metadata["references_status"] = "success" if isinstance(references, list) else "failed"
+    metadata["references_count"] = len(references) if isinstance(references, list) else 0
     metadata["source_status"] = "downloaded" if tex_files or bib_files else "no_tex_or_bib"
     save_json_file(metadata, metadata_path)
     return {
@@ -182,6 +223,9 @@ def get_source(
         "version_dir": str(version_dir),
         "tex_files": tex_files,
         "bib_files": bib_files,
+        "raw_archive_bytes": raw_archive_bytes,
+        "total_uncompressed_bytes": total_uncompressed_bytes,
+        "filtered_uncompressed_bytes": filtered_uncompressed_bytes,
         "source_status": metadata["source_status"],
     }
 
@@ -193,10 +237,39 @@ if __name__ == "__main__":
         for paper in client.results(search):
             latest = paper.entry_id.rsplit("/", 1)[-1]
             base_id, _, latest_version = latest.rpartition("v")
-            print(latest)
-            print(base_id)
-            print(latest_version)
-            references = get_paper_references(base_id)
+            print(f"[{base_id}] (Latest: v{latest_version})")
+
+            paper_dir = Path("./sourcesArxiv") / base_id.replace("/", "-")
+            all_versions_exist = True
+            for v_num in range(1, int(latest_version) + 1):
+                v_meta = paper_dir / f"v{v_num}" / "metadata.json"
+                if not v_meta.exists():
+                    all_versions_exist = False
+                    break
+                try:
+                    with open(v_meta, "r", encoding="utf-8") as f_m:
+                        if json.load(f_m).get("source_status") not in {"downloaded", "no_tex_or_bib"}:
+                            all_versions_exist = False
+                            break
+                except Exception:
+                    all_versions_exist = False
+                    break
+
+            if all_versions_exist:
+                print(f"  Bo qua toan bo {base_id} (da tai du {latest_version} phien ban)")
+                continue
+
+            ref_file = paper_dir / "v1" / "references.json"
+            references = None
+            if ref_file.exists():
+                try:
+                    with open(ref_file, "r", encoding="utf-8") as f_r:
+                        references = json.load(f_r)
+                except Exception:
+                    references = None
+
+            if references is None:
+                references = get_paper_references(base_id)
 
             for version_number in range(1, int(latest_version) + 1):
                 get_source(
