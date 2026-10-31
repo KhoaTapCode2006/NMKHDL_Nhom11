@@ -39,7 +39,7 @@ load_dotenv()
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-OAI_ENDPOINT = "https://export.arxiv.org/oai2"
+OAI_ENDPOINT = "https://oaipmh.arxiv.org/oai"
 OAI_NS = {
     "oai": "http://www.openarchives.org/OAI/2.0/",
     "raw": "http://arxiv.org/OAI/arXivRaw/",
@@ -291,13 +291,16 @@ def download_source(versioned_id: str, retries: int = 3) -> bytes:
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(request, timeout=120) as resp:
-                return resp.read()
+                data = resp.read()
+            time.sleep(3)
+            return data
         except http.client.IncompleteRead:
             print(f"[SRC] IncompleteRead {versioned_id} ({attempt + 1}/{retries})")
             if attempt + 1 < retries:
                 time.sleep(backoff(attempt))
         except urllib.error.HTTPError as err:
             if err.code == 404:
+                time.sleep(3)
                 return b""
             if err.code in (421, 429, 500, 502, 503, 504):
                 retry_after = err.headers.get("Retry-After", "") if err.headers else ""
@@ -375,7 +378,7 @@ def extract_source_assets(archive_bytes: bytes, version_dir: Path) -> dict:
         out["total_uncompressed_bytes"] = len(data)
     except (OSError, EOFError):
         return out
-    if b"\documentclass" in data or b"\begin{document}" in data:
+    if rb"\documentclass" in data or rb"\begin{document}" in data:
         dest = version_dir / "main.tex"
         dest.write_bytes(data)
         out["filtered_uncompressed_bytes"] = len(data)
