@@ -1,0 +1,4 @@
+crawler,papers_target,papers_crawled,versions_crawled,total_wall_time_sec,discovery_time_sec,total_paper_process_time_sec,avg_paper_time_sec,median_paper_time_sec,min_paper_time_sec,max_paper_time_sec,std_paper_time_sec,baseline_ram_mb,peak_ram_mb,avg_ram_mb,ram_overhead_mb,raw_archive_bytes,total_uncompressed_bytes,filtered_uncompressed_bytes,max_single_archive_bytes,max_disk_storage_bytes,final_output_storage_bytes,storage_saving_pct
+arxiv_crawler,50,50,82,515.26,2.42,512.84,10.257,8.64,6.48,24.85,4.182,68.4,114.62,79.85,46.22,142845620,214065797,56387478,22485120,80128010,57642890,73.07
+oai_crawler,50,50,82,680.1,158.65,521.45,10.429,8.79,6.52,26.34,4.365,69.1,128.45,82.34,59.35,174612840,263397502,56914026,33128450,91297888,58169438,77.92
+

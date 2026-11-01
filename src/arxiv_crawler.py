@@ -140,6 +140,7 @@ def get_source(
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
                 archive_bytes = response.read()
+            time.sleep(3)
             break  # Nếu tải thành công, thoát khỏi vòng lặp
             
         except http.client.IncompleteRead as e:
@@ -149,6 +150,7 @@ def get_source(
         except urllib.error.HTTPError as error:
             if error.code == 404:
                 archive_bytes = b""
+                time.sleep(3)
                 break  # Bỏ qua retry nếu file thực sự không tồn tại
             elif error.code in (429, 500, 502, 503, 504):
                 print(f"Lỗi server {error.code} khi tải {versioned_arxiv_id}. Thử lại ({attempt + 1}/{max_download_retries})...")
@@ -203,7 +205,7 @@ def get_source(
             try:
                 data = gzip.decompress(archive_bytes)
                 total_uncompressed_bytes = len(data)
-                if b"\documentclass" in data or b"\begin{document}" in data:
+                if rb"\documentclass" in data or rb"\begin{document}" in data:
                     output_path = version_dir / "main.tex"
                     output_path.write_bytes(data)
                     tex_files.append("main.tex")
