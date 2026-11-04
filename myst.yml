@@ -2,7 +2,9 @@
 version: 1
 project:
   id: b71f1e95-eb6b-4fd3-b9c2-8e86690f4f20
-  # title:
+  title: "NMKHDL - Nhóm 11"
+  toc:
+    - file: src/final.ipynb
   # description:
   # keywords: []
   # authors: []
