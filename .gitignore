@@ -12,3 +12,6 @@ sourcesOAI/
 .json
 .tex
 .bib
+
+# MyST build outputs
+_build
