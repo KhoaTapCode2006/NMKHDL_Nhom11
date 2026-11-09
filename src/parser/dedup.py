@@ -110,8 +110,9 @@ class ElementDeduplicator:
 
                 raw_id_to_final_id[raw_id] = final_id
 
-            # Ánh xạ lại các cạnh cha-con (version kiểu int, parent_id không null)
+            # Ánh xạ lại các cạnh cha-con (version kiểu int, parent_id không null, không trùng lặp cạnh)
             v_num = int(v_name[1:]) if v_name.startswith("v") and v_name[1:].isdigit() else int(v_name)
+            seen_edges_in_version = set()
             for edge in raw_hierarchy:
                 raw_child = edge["element_raw_id"]
                 raw_parent = edge["parent_raw_id"]
@@ -122,13 +123,16 @@ class ElementDeduplicator:
                 final_child = raw_id_to_final_id.get(raw_child)
                 final_parent = raw_id_to_final_id.get(raw_parent)
 
-                if final_child and final_parent is not None:
-                    unified_hierarchy.append({
-                        "arxiv_id": arxiv_id,
-                        "version": v_num,
-                        "element_id": final_child,
-                        "parent_id": final_parent,
-                    })
+                if final_child and final_parent is not None and final_child != final_parent:
+                    edge_key = (v_num, final_child, final_parent)
+                    if edge_key not in seen_edges_in_version:
+                        seen_edges_in_version.add(edge_key)
+                        unified_hierarchy.append({
+                            "arxiv_id": arxiv_id,
+                            "version": v_num,
+                            "element_id": final_child,
+                            "parent_id": final_parent,
+                        })
 
         total_after = len(unique_elements)
         reduction_count = total_before - total_after

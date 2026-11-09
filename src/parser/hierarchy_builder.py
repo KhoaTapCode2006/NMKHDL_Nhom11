@@ -1,8 +1,8 @@
 """
-Module xây dựng cây phân cấp (Hierarchy Construction - Phần của Tân).
+Module xây dựng cây phân cấp (Hierarchy Construction).
 Đọc dữ liệu LaTeX từ folder `elements/` và dựng cây phân cấp cho từng version
 theo đúng quy tắc Parsing Notes của Milestone 2:
-1. Giữ nguyên nội dung LaTeX thô (Raw Content) ở các nút để Khoa làm sạch/chuẩn hóa.
+1. Giữ nguyên nội dung LaTeX thô (Raw Content) ở các nút để ông Khoa làm sạch/chuẩn hóa cho tiện nhé.
 2. Loại bỏ References khỏi cây nhưng lưu riêng vào `raw_references.json` cho Khoa tách BibTeX.
 3. Nút gốc có ID `<arxiv_id>#root1`, chỉ đóng vai trò `parent_id` (đảm bảo `parent_id` không null).
 4. Ghi nhận tường minh các version rỗng (Empty Records) khi không có file .tex.
@@ -95,7 +95,14 @@ class HierarchyBuilder:
         def _capture_bib_env(m: re.Match) -> str:
             block = m.group(0).strip()
             preserved_bib_envs.append(block)
-            items = re.split(r"(?=\\bibitem\b)", block)
+            # Cắt bỏ thẻ đóng \end{thebibliography} trước khi tách các \bibitem
+            inner_block = re.sub(
+                r"\\end\{(?:thebibliography|references|bibunit)\}\s*$",
+                "",
+                block,
+                flags=re.IGNORECASE,
+            )
+            items = re.split(r"(?=\\bibitem\b)", inner_block)
             for it in items:
                 if it.strip().startswith("\\bibitem"):
                     preserved_bibitems.append(it.strip())
@@ -115,7 +122,7 @@ class HierarchyBuilder:
         body = re.sub(r"\\bibliography(?:style)?\s*\{[^{}]*\}", "", body)
         body = re.sub(r"\\printbibliography(?:\s*\[[^\]]*\])?", "", body)
 
-        # 2. Chuyển môi trường acknowledgments/abstract/appendix thành \section* để đưa vào cây
+        # 2. Chuyển môi trường acknowledgments/abstract/appendix thành \section* hoặc \appendix để đưa vào cây
         body = re.sub(
             r"\\begin\{acknowledg(?:e)?ments\*?\}(.*?)\\end\{acknowledg(?:e)?ments\*?\}",
             r"\n\\section*{Acknowledgements}\n\1\n",
@@ -128,9 +135,17 @@ class HierarchyBuilder:
             body,
             flags=re.DOTALL | re.IGNORECASE,
         )
+
+        def _convert_appendix_env(m: re.Match) -> str:
+            inner_app = m.group(1)
+            # Nếu bên trong môi trường appendix đã có sẵn \section hoặc \chapter thì dùng cờ \appendix
+            if re.search(r"\\(?:chapter|section)\*?\s*(?:\[[^\]]*\])?\{", inner_app):
+                return f"\n\\appendix\n{inner_app}\n"
+            return f"\n\\section*{{Appendix}}\n{inner_app}\n"
+
         body = re.sub(
             r"\\begin\{appendi(?:x|ces)\}(.*?)\\end\{appendi(?:x|ces)\}",
-            r"\n\\section*{Appendix}\n\1\n",
+            _convert_appendix_env,
             body,
             flags=re.DOTALL | re.IGNORECASE,
         )
@@ -185,16 +200,16 @@ class HierarchyBuilder:
 
         work = text
 
-        # 1. Che công thức toán inline: \(...\) và $...$
+        # 1. Che công thức toán inline: \(...\) và $...$ (bỏ qua ký tự \$ đã escape)
         work = re.sub(r"\\\((.*?)\\\)", lambda m: mask(m, "INLMATH"), work, flags=re.DOTALL)
-        work = re.sub(r"\$[^$]+\$", lambda m: mask(m, "MATH"), work)
+        work = re.sub(r"(?<!\\)\$(?:\\.|[^$\\])+(?<!\\)\$", lambda m: mask(m, "MATH"), work)
 
-        # 2. Che đường dẫn URL
-        work = re.sub(r"https?://[^\s\}]+", lambda m: mask(m, "URL"), work)
+        # 2. Che đường dẫn URL (không ăn dấu câu kết thúc câu như .,;:!?) ở cuối URL)
+        work = re.sub(r"https?://[^\s\}]+(?<![.,;:!?\)\]])", lambda m: mask(m, "URL"), work)
 
-        # 3. Che các lệnh LaTeX có tham số (ví dụ: \cite{...}, \ref{fig.1})
+        # 3. Che các lệnh LaTeX có tham số (ví dụ: \cite{...}, \ref{fig.1}, \href{...}{...})
         work = re.sub(
-            r"\\[a-zA-Z]+\*?(?:\[[^\]]*\])?\{(?:[^{}]|\{[^{}]*\})*\}",
+            r"\\[a-zA-Z]+\*?(?:\[[^\]]*\])?(?:\{(?:[^{}]|\{[^{}]*\})*\})+",
             lambda m: mask(m, "CMD"),
             work,
         )
@@ -211,11 +226,13 @@ class HierarchyBuilder:
                 flags=re.IGNORECASE,
             )
 
-        # 6. Tách câu tại dấu [.!?] theo sau là khoảng trắng và chữ hoa/số/ngoặc/lệnh
-        raw_parts = re.split(
-            r"(?<=[.!?])\s+(?=[A-Z0-9\(\[\"\'\\]|__(?:MATH|INLMATH|CMD|ABBR)_)",
+        # 6. Tách câu tại dấu [.!?] (kể cả khi theo sau dấu chấm là dấu đóng ngoặc/nháy hoặc lệnh \footnote/\cite)
+        work_with_breaks = re.sub(
+            r"([.!?](?:[\)\]\'\"]+|__CMD_\d+__)*)\s+(?=[A-Za-z0-9\(\[\"\'\\]|__(?:MATH|INLMATH|CMD|ABBR|URL)_)",
+            r"\1\n__SENT_BREAK__\n",
             work,
         )
+        raw_parts = work_with_breaks.split("\n__SENT_BREAK__\n")
 
         sentences: List[str] = []
         for part in raw_parts:
@@ -247,7 +264,7 @@ class HierarchyBuilder:
             r"(?P<heading>\\(?:part|chapter|section|subsection|subsubsection|paragraph|subparagraph)\*?(?:\[[^\]]*\])?\s*\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})|"
             r"(?P<appendix>\\appendix\b)|"
             r"(?P<formula_env>\\begin\{(?P<f_env>equation\*?|align\*?|gather\*?|multline\*?|eqnarray\*?|flalign\*?|displaymath)\}.*?\\end\{(?P=f_env)\})|"
-            r"(?P<formula_dollar>\$\$.*?\$\$)|"
+            r"(?P<formula_dollar>(?<!\\)\$\$.*?(?<!\\)\$\$)|"
             r"(?P<formula_bracket>\\\[.*?\\\])|"
             r"(?P<figure>\\begin\{(?P<fig_env>figure\*?|table\*?|algorithm\*?)\}.*?\\end\{(?P=fig_env)\})|"
             r"(?P<list_begin>\\begin\{(?:itemize|enumerate|description)\})",
@@ -424,7 +441,7 @@ class HierarchyBuilder:
                         })
                 elif b_type == "list":
                     process_list_block(b_text, parent_id)
-                elif b_type == "prose":
+                elif b_type in ("prose", "heading"):
                     for sent in cls.split_sentences_safe(b_text):
                         s_id = next_id("s")
                         elements.append({
@@ -440,13 +457,13 @@ class HierarchyBuilder:
                         })
 
         def process_list_block(list_text: str, parent_id: str) -> None:
-            """Xử lý khối itemize/enumerate làm nhánh cha và từng \\item làm nhánh con."""
+            """Xử lý khối itemize/enumerate làm nhánh cha, từng \\item làm nhánh trung gian và tạo các sentence leaf bên dưới."""
             env_name, items = cls._split_list_items(list_text)
             list_id = next_id("itemize")
             elements.append({
                 "raw_id": list_id,
                 "kind": "itemize",
-                "content": f"\\begin{{{env_name}}}...\\end{{{env_name}}}",
+                "content": cls.normalize_whitespace_only(list_text),
             })
             hierarchy.append({
                 "arxiv_id": arxiv_id,
@@ -456,19 +473,15 @@ class HierarchyBuilder:
             })
 
             for item_raw in items:
-                sub_blocks = cls._extract_top_level_blocks(item_raw)
-                prose_parts = [b_txt for b_tp, b_txt in sub_blocks if b_tp == "prose"]
-                item_raw_text = cls.normalize_whitespace_only(
-                    " ".join(prose_parts) if prose_parts else item_raw
-                )
-                if not item_raw_text:
+                item_clean = cls.normalize_whitespace_only(item_raw)
+                if not item_clean:
                     continue
 
                 item_id = next_id("item")
                 elements.append({
                     "raw_id": item_id,
                     "kind": "item",
-                    "content": item_raw_text,
+                    "content": f"\\item {item_clean}",
                 })
                 hierarchy.append({
                     "arxiv_id": arxiv_id,
@@ -477,11 +490,22 @@ class HierarchyBuilder:
                     "parent_raw_id": list_id,
                 })
 
-                # Nếu trong \item có nhiều câu hoặc chứa công thức/danh sách con thì phân nhánh tiếp
-                sentences = cls.split_sentences_safe(" ".join(prose_parts))
-                has_non_prose = any(b_tp != "prose" for b_tp, _ in sub_blocks)
-                if len(sentences) > 1 or has_non_prose:
-                    parse_content_into_parent(item_raw, item_id)
+                # Luôn tách nội dung bên trong \item thành các nút lá (sentence, block_formula, figure) hoặc list con
+                before_len = len(elements)
+                parse_content_into_parent(item_raw, item_id)
+                if len(elements) == before_len:
+                    s_id = next_id("s")
+                    elements.append({
+                        "raw_id": s_id,
+                        "kind": "sentence",
+                        "content": item_clean,
+                    })
+                    hierarchy.append({
+                        "arxiv_id": arxiv_id,
+                        "version": v_num,
+                        "element_raw_id": s_id,
+                        "parent_raw_id": item_id,
+                    })
 
         top_blocks = cls._extract_top_level_blocks(body_tex)
 
@@ -502,6 +526,9 @@ class HierarchyBuilder:
                     continue
                 h_type = hm.group("type").lower()
                 raw_title = cls.normalize_whitespace_only(hm.group("title"))
+                if not raw_title:
+                    # Bỏ qua tiêu đề rỗng (ví dụ: \paragraph{} dùng để ngắt dòng)
+                    continue
                 h_level = cls.HEADING_LEVELS.get(h_type, 2)
 
                 # Chuẩn hóa tên tiêu đề tạm thời để kiểm tra xem có phải mục References không
@@ -523,8 +550,11 @@ class HierarchyBuilder:
                     preserved_refs["reference_sections"].append(b_text)
                     continue
 
-                # Đánh dấu các mục thuộc Appendix
-                if in_appendix and h_type in ("chapter", "section") and not raw_title.lower().startswith("appendix"):
+                # Nếu gặp tiêu đề bao ngoài là "Appendix" hoặc "Appendices", đặt cấp = 1 để làm cha cho các \section phụ lục bên dưới
+                if norm_title in ("appendix", "appendices") and h_type == "section":
+                    h_level = 1
+                    in_appendix = True
+                elif in_appendix and h_type in ("chapter", "section") and not raw_title.lower().startswith("appendix"):
                     raw_title = f"Appendix: {raw_title}"
 
                 # Rút các mục cùng cấp hoặc cấp thấp hơn ra khỏi stack để tìm đúng nút cha
@@ -551,7 +581,13 @@ class HierarchyBuilder:
             # Nếu đang nằm trong mục References thì lưu nội dung cho Khoa và bỏ qua khỏi cây
             if skip_until_level is not None:
                 preserved_refs["reference_sections"].append(b_text)
-                for m_item in re.split(r"(?=\\bibitem\b)", b_text):
+                clean_ref_text = re.sub(
+                    r"\\end\{(?:thebibliography|references|bibunit)\}\s*$",
+                    "",
+                    b_text,
+                    flags=re.IGNORECASE,
+                )
+                for m_item in re.split(r"(?=\\bibitem\b)", clean_ref_text):
                     if m_item.strip().startswith("\\bibitem"):
                         preserved_refs["bibitem_entries"].append(m_item.strip())
                 continue
@@ -745,11 +781,16 @@ class HierarchyBuilder:
             f"root{v_num}",
             f"doc_{version_name}",
         ]
-        root_id = candidate_roots[0]
+        root_id = None
         for cr in candidate_roots:
             if cr in elem_lookup:
                 root_id = cr
                 break
+
+        if root_id is None:
+            raise ValueError(
+                f"Dữ liệu hierarchy không hợp lệ: Không tìm thấy nút gốc (root) cho {arxiv_id} version {version_name} trong bảng elements."
+            )
 
         children_map: Dict[str, List[str]] = {}
         for edge in hierarchy_edges:
@@ -757,21 +798,41 @@ class HierarchyBuilder:
             if edge_v == v_num or edge_v == version_name:
                 p_id = edge.get("parent_id") or edge.get("parent_raw_id")
                 c_id = edge.get("element_id") or edge.get("element_raw_id")
-                if p_id and c_id:
-                    children_map.setdefault(p_id, []).append(c_id)
+                if not p_id or not c_id:
+                    raise ValueError(
+                        f"Dữ liệu hierarchy không hợp lệ: Cạnh thiếu parent_id hoặc element_id ({edge})."
+                    )
+                if p_id not in elem_lookup:
+                    raise ValueError(
+                        f"Dữ liệu hierarchy không hợp lệ: parent_id '{p_id}' không tồn tại trong bảng elements."
+                    )
+                if c_id not in elem_lookup:
+                    raise ValueError(
+                        f"Dữ liệu hierarchy không hợp lệ: element_id '{c_id}' không tồn tại trong bảng elements."
+                    )
+                children_map.setdefault(p_id, []).append(c_id)
+
+        active_path: set[str] = set()
 
         def build_node(node_id: str) -> Dict[str, Any]:
-            info = elem_lookup.get(node_id, {
-                "element_id": node_id,
-                "kind": "unknown",
-                "content": "",
-            })
+            if node_id not in elem_lookup:
+                raise ValueError(
+                    f"Dữ liệu hierarchy không hợp lệ: node '{node_id}' không tồn tại trong bảng elements."
+                )
+            if node_id in active_path:
+                raise ValueError(
+                    f"Dữ liệu hierarchy không hợp lệ: Phát hiện chu trình (cycle) tại node '{node_id}'."
+                )
+            active_path.add(node_id)
+            info = elem_lookup[node_id]
             child_ids = children_map.get(node_id, [])
+            children_nodes = [build_node(cid) for cid in child_ids]
+            active_path.remove(node_id)
             return {
                 "element_id": info.get("element_id", info.get("raw_id", node_id)),
-                "kind": info.get("kind", "unknown"),
-                "content": info.get("content", ""),
-                "children": [build_node(cid) for cid in child_ids],
+                "kind": info["kind"],
+                "content": info["content"],
+                "children": children_nodes,
             }
 
         return {
