@@ -1,0 +1,19 @@
+# See docs at: https://mystmd.org/guide/frontmatter
+version: 1
+project:
+  id: b71f1e95-eb6b-4fd3-b9c2-8e86690f4f20
+  title: "NMKHDL - Nhóm 11"
+  toc:
+    - file: src/final.ipynb
+  # description:
+  # keywords: []
+  # authors: []
+  exclude:
+    - README.md
+  github: https://github.com/KhoaTapCode2006/NMKHDL_Nhom11
+  # To autogenerate a Table of Contents, run "jupyter book init --write-toc"
+site:
+  template: book-theme
+  # options:
+  #   favicon: favicon.ico
+  #   logo: site_logo.png

@@ -9,4 +9,9 @@ sourcesOAI/
 .jpg
 .png
 .mp4
-.gitignore
+.json
+.tex
+.bib
+
+# MyST build outputs
+_build
