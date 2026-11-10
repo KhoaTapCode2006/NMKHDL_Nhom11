@@ -1,24 +1,22 @@
 """
-Cross-version Element Deduplication and Hierarchy Edge Mapper.
-Implements Milestone 2 deduplication specifications:
-- Deduplicates identical elements across versions using (kind, normalized_content) key
-- Keeps separate Document root elements for each version
-- Remaps hierarchy edges to the unified element_ids
-- Computes comprehensive deduplication statistics
+Khử trùng lặp các phần tử (Elements) xuyên version và ánh xạ lại cạnh cây phân cấp (Hierarchy).
+- Gộp các phần tử có cùng (kind, nội_dung) giữa các version về chung 1 element_id.
+- Mỗi version giữ 1 nút gốc Document riêng (<arxiv_id>#root1, #root2...).
+- Cập nhật các cạnh trong bảng hierarchy với version kiểu int và parent_id không null.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any
 
 
 class ElementDeduplicator:
-    """Deduplicates publication elements across versions and remaps hierarchy."""
+    """Khử trùng lặp phần tử giữa các version của bài báo và ánh xạ lại bảng hierarchy."""
 
     @classmethod
     def normalize_content_key(cls, content: str) -> str:
-        """Normalizes content string for hashing/matching (collapsing whitespace)."""
+        """Chuẩn hóa khoảng trắng của chuỗi nội dung để so khớp trùng lặp."""
         return re.sub(r"\s+", " ", content).strip()
 
     @classmethod
@@ -28,43 +26,24 @@ class ElementDeduplicator:
         version_parsed_data: Dict[str, Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]],
     ) -> Dict[str, Any]:
         """
-        Deduplicates elements across all versions of a single publication.
-
-        Args:
-            arxiv_id: Base arXiv ID (e.g. "2411.13799")
-            version_parsed_data: Map of {version_name: (elements_list, hierarchy_list)}
-
-        Returns:
-            {
-                "arxiv_id": str,
-                "elements": List[Dict[str, Any]],       # Deduplicated table: element_id, arxiv_id, kind, content
-                "hierarchy": List[Dict[str, Any]],      # Unified hierarchy table: arxiv_id, version, element_id, parent_id
-                "stats": {
-                    "total_before": int,
-                    "total_after": int,
-                    "reduction_count": int,
-                    "reduction_percentage": float,
-                    "by_kind_before": Dict[str, int],
-                    "by_kind_after": Dict[str, int],
-                }
-            }
+        Khử trùng lặp phần tử trên tất cả các version của 1 bài báo.
+        Trả về bảng elements duy nhất, bảng cạnh hierarchy và thống kê trước/sau dedup.
         """
-        # Element storage
         unique_elements: List[Dict[str, Any]] = []
-        # Key: (kind, normalized_content) -> element_id
+        # Ánh xạ (kind, nội_dung_chuẩn_hóa) -> element_id
         content_to_id: Dict[Tuple[str, str], str] = {}
 
-        # Counter by kind for assigning clean IDs like 2411.13799#s1, #sec1, #fig1, etc.
+        # Bộ đếm theo từng loại phần tử để đánh mã ID (ví dụ: #s1, #sec1, #fig1)
         kind_counters: Dict[str, int] = {}
 
         def get_kind_prefix(k: str) -> str:
             if k == "sentence":
                 return "s"
-            if k in ("section", "chapter"):
+            if k in ("section", "chapter", "part"):
                 return "sec"
             if k == "subsection":
                 return "ssec"
-            if k in ("subsubsection", "paragraph"):
+            if k in ("subsubsection", "paragraph", "subparagraph"):
                 return "par"
             if k == "block_formula":
                 return "eq"
@@ -80,7 +59,7 @@ class ElementDeduplicator:
         by_kind_before: Dict[str, int] = {}
         unified_hierarchy: List[Dict[str, Any]] = []
 
-        # Process versions in sorted order (v1, v2, ...)
+        # Duyệt các version theo thứ tự (v1, v2, ...)
         sorted_versions = sorted(version_parsed_data.keys())
 
         for v_name in sorted_versions:
@@ -95,9 +74,10 @@ class ElementDeduplicator:
 
                 by_kind_before[kind] = by_kind_before.get(kind, 0) + 1
 
-                # Rule from Milestone 2: Each version has its own distinct Document root
+                # Mỗi version có nút gốc Document riêng (<arxiv_id>#root1, #root2)
+                v_num = int(v_name[1:]) if v_name.startswith("v") and v_name[1:].isdigit() else int(v_name)
                 if kind == "document":
-                    final_id = f"{arxiv_id}#doc_{v_name}"
+                    final_id = f"{arxiv_id}#root{v_num}"
                     raw_id_to_final_id[raw_id] = final_id
                     unique_elements.append({
                         "element_id": final_id,
@@ -107,14 +87,14 @@ class ElementDeduplicator:
                     })
                     continue
 
-                # Content key for deduplication
+                # Khóa so khớp nội dung
                 norm_key = (kind, cls.normalize_content_key(content))
 
                 if norm_key in content_to_id:
-                    # Reuse existing element_id
+                    # Tái sử dụng element_id đã có từ version trước
                     final_id = content_to_id[norm_key]
                 else:
-                    # Create new element_id
+                    # Tạo element_id mới
                     prefix = get_kind_prefix(kind)
                     count = kind_counters.get(prefix, 0) + 1
                     kind_counters[prefix] = count
@@ -130,21 +110,29 @@ class ElementDeduplicator:
 
                 raw_id_to_final_id[raw_id] = final_id
 
-            # Remap hierarchy edges for this version
+            # Ánh xạ lại các cạnh cha-con (version kiểu int, parent_id không null, không trùng lặp cạnh)
+            v_num = int(v_name[1:]) if v_name.startswith("v") and v_name[1:].isdigit() else int(v_name)
+            seen_edges_in_version = set()
             for edge in raw_hierarchy:
                 raw_child = edge["element_raw_id"]
                 raw_parent = edge["parent_raw_id"]
 
-                final_child = raw_id_to_final_id.get(raw_child)
-                final_parent = raw_id_to_final_id.get(raw_parent) if raw_parent else None
+                if raw_parent is None:
+                    continue
 
-                if final_child:
-                    unified_hierarchy.append({
-                        "arxiv_id": arxiv_id,
-                        "version": v_name,
-                        "element_id": final_child,
-                        "parent_id": final_parent,
-                    })
+                final_child = raw_id_to_final_id.get(raw_child)
+                final_parent = raw_id_to_final_id.get(raw_parent)
+
+                if final_child and final_parent is not None and final_child != final_parent:
+                    edge_key = (v_num, final_child, final_parent)
+                    if edge_key not in seen_edges_in_version:
+                        seen_edges_in_version.add(edge_key)
+                        unified_hierarchy.append({
+                            "arxiv_id": arxiv_id,
+                            "version": v_num,
+                            "element_id": final_child,
+                            "parent_id": final_parent,
+                        })
 
         total_after = len(unique_elements)
         reduction_count = total_before - total_after
