@@ -1,6 +1,7 @@
 """
 Multi-file gathering for LaTeX publications.
 Identifies root TeX file, recursively resolves \\input and \\include,
+honors \\includeonly, avoids cycle misdetection via call stack tracking,
 builds compilation path, and manages redundant file cleanup.
 """
 
@@ -19,9 +20,16 @@ class MultiFileGatherer:
     # Matches LaTeX comments (% not preceded by an odd number of backslashes)
     COMMENT_PATTERN = re.compile(r"(?<!\\)(?:\\\\)*%.*$", re.MULTILINE)
 
-    # Matches \input{...} and \include{...} (supports spaces and optional quotes)
+    # Matches \include{...}, \input{...}, and unbraced \input filename (TeX primitive syntax)
+    # Group 1 & 2: \include{target}
+    # Group 3 & 4: \input{target}
+    # Group 5 & 6: \input target (unbraced filename up to space, %, newline or command)
     INPUT_INCLUDE_PATTERN = re.compile(
-        r"\\(?:input|include)\s*\{[\"']?([^}\"'\n]+)[\"']?\}"
+        r"\\(?:"
+        r"(include)\s*\{[\"']?([^}\"'\n]+)[\"']?\}|"
+        r"(input)\s*\{[\"']?([^}\"'\n]+)[\"']?\}|"
+        r"(input)\s+[\"']?([a-zA-Z0-9_\-\./\\]+)[\"']?"
+        r")"
     )
 
     STANDARD_ROOT_NAMES = {
@@ -49,12 +57,35 @@ class MultiFileGatherer:
         return cls.COMMENT_PATTERN.sub("", text)
 
     @classmethod
+    def parse_includeonly(cls, preamble_text: str) -> Optional[Set[str]]:
+        """
+        Parses \\includeonly{...} from preamble if present.
+        Returns None if \\includeonly is not specified (all \\include commands allowed).
+        Returns a set of normalized file names (without .tex extension) if specified.
+        """
+        clean = cls.strip_comments(preamble_text)
+        m = re.search(r"\\includeonly\s*\{([^}]+)\}", clean)
+        if not m:
+            return None
+        raw_list = m.group(1).split(",")
+        allowed = set()
+        for item in raw_list:
+            norm = item.strip().replace("\\", "/").strip('"\'')
+            if norm.lower().endswith(".tex"):
+                norm = norm[:-4]
+            if norm:
+                allowed.add(norm)
+                allowed.add(norm.lower())
+        return allowed
+
+    @classmethod
     def find_root_file(
         cls, version_dir: Path, metadata: Optional[dict] = None
     ) -> Optional[Path]:
         """
         Locates the root .tex file containing \\documentclass or \\documentstyle.
         Uses heuristics and metadata title matching in case of multiple candidates.
+        Returns None if no candidate contains a valid document root structure.
         """
         tex_files = list(version_dir.glob("**/*.tex"))
         if not tex_files:
@@ -81,10 +112,9 @@ class MultiFileGatherer:
                 except Exception:
                     continue
 
+        # If still no candidates with documentclass, documentstyle, or begin{document},
+        # it is NOT a valid root document. Do NOT blindly pick a lone random .tex file.
         if not candidates:
-            # Fallback: if only 1 tex file exists, use it
-            if len(tex_files) == 1:
-                return tex_files[0]
             return None
 
         if len(candidates) == 1:
@@ -108,7 +138,6 @@ class MultiFileGatherer:
         # Score candidates
         title_keywords = []
         if metadata and "title" in metadata and metadata["title"]:
-            # Extract distinctive alphanumeric words (>3 chars) from paper title
             title_keywords = [
                 w.lower()
                 for w in re.findall(r"[A-Za-z0-9]{4,}", metadata["title"])
@@ -120,25 +149,20 @@ class MultiFileGatherer:
 
         for path, raw, clean in filtered_candidates:
             score = 0
-            # Has \begin{document}
             if "\\begin{document}" in clean:
                 score += 50
 
-            # Matches standard root names
             if path.name.lower() in cls.STANDARD_ROOT_NAMES:
                 score += 30
 
-            # Title keyword matching
             clean_lower = clean.lower()
             if title_keywords:
                 matches = sum(1 for kw in title_keywords if kw in clean_lower)
                 score += matches * 15
 
-            # Prefer shallower files (closer to version root)
             depth = len(path.relative_to(version_dir).parts)
             score += max(0, 10 - depth * 2)
 
-            # Prefer larger file size
             try:
                 size_kb = path.stat().st_size / 1024
                 score += min(10, size_kb / 5)
@@ -159,12 +183,10 @@ class MultiFileGatherer:
         Resolves an include/input target string to an existing file path.
         Checks both relative to current file's directory and relative to root_dir.
         """
-        # Normalize slashes and clean up
         normalized = target_str.strip().replace("\\", "/").strip('"\'')
         if not normalized:
             return None
 
-        # Build candidate paths
         candidate_rel_paths = [normalized]
         if not normalized.lower().endswith(".tex"):
             candidate_rel_paths.append(f"{normalized}.tex")
@@ -176,7 +198,7 @@ class MultiFileGatherer:
                 if candidate.is_file():
                     return candidate
 
-        # Case-insensitive search fallback
+        # Case-insensitive fallback
         for base in search_bases:
             for rel in candidate_rel_paths:
                 parts = rel.split("/")
@@ -210,15 +232,8 @@ class MultiFileGatherer:
     ) -> dict:
         """
         Performs full multi-file gathering for a single version directory.
-        Returns:
-            {
-                "success": bool,
-                "root_file": Optional[Path],
-                "compilation_files": List[Path],
-                "orphan_files": List[Path],
-                "inlined_content": str,
-                "error": Optional[str]
-            }
+        Properly honors compilation path, \\includeonly, call-stack cycle detection,
+        and accurately reports whether gathering was fully complete or failed.
         """
         version_dir = Path(version_dir).resolve()
         all_tex_files = sorted(list(version_dir.glob("**/*.tex")))
@@ -226,10 +241,14 @@ class MultiFileGatherer:
         if not all_tex_files:
             return {
                 "success": False,
+                "is_complete": False,
                 "root_file": None,
                 "compilation_files": [],
                 "orphan_files": [],
                 "inlined_content": "",
+                "unresolved_includes": [],
+                "cycle_errors": [],
+                "read_errors": [],
                 "error": "No .tex files found in version directory (empty version)",
             }
 
@@ -237,72 +256,114 @@ class MultiFileGatherer:
         if not root_file:
             return {
                 "success": False,
+                "is_complete": False,
                 "root_file": None,
                 "compilation_files": [],
                 "orphan_files": [f.resolve() for f in all_tex_files],
                 "inlined_content": "",
-                "error": "Failed to identify root .tex file",
+                "unresolved_includes": [],
+                "cycle_errors": [],
+                "read_errors": [],
+                "error": "Failed to identify root .tex file (no valid \\documentclass or \\documentstyle)",
             }
 
-        visited_paths: Set[Path] = set()
+        # Parse \includeonly if present in root file preamble
+        includeonly_set = None
+        try:
+            root_raw = root_file.read_text(encoding="utf-8", errors="ignore")
+            # Only search in preamble (before \begin{document})
+            preamble_part = root_raw.split(r"\begin{document}")[0]
+            includeonly_set = cls.parse_includeonly(preamble_part)
+        except Exception:
+            pass
+
+        # Call stack tracks the active ancestor chain to detect real cycles
+        # (Allows the same file to be legitimately included multiple times at different points)
+        call_stack: List[Path] = []
         compilation_files: List[Path] = []
+
+        unresolved_includes: List[str] = []
+        cycle_errors: List[str] = []
+        read_errors: List[str] = []
 
         def inline_recursive(current_file: Path) -> str:
             current_file = current_file.resolve()
-            if current_file in visited_paths:
-                return f"\n% [Cycle detected: {current_file.name}]\n"
 
-            visited_paths.add(current_file)
-            compilation_files.append(current_file)
+            # Cycle detection: check against active call stack, not global set
+            if current_file in call_stack:
+                cycle_chain = " -> ".join([p.name for p in call_stack] + [current_file.name])
+                cycle_errors.append(cycle_chain)
+                return f"\n% [Cycle detected: {cycle_chain}]\n"
+
+            call_stack.append(current_file)
+            if current_file not in compilation_files:
+                compilation_files.append(current_file)
 
             try:
                 content = current_file.read_text(encoding="utf-8", errors="ignore")
             except Exception as e:
-                return f"\n% [Read error in {current_file.name}: {e}]\n"
+                err_msg = f"{current_file.name}: {e}"
+                read_errors.append(err_msg)
+                call_stack.pop()
+                return f"\n% [Read error in {err_msg}]\n"
 
             curr_dir = current_file.parent
-
-            # We process line-by-line to properly honor comments
             output_lines = []
-            for line in content.splitlines(keepends=True):
-                # Identify comments on this line
-                clean_line = cls.strip_comments(line)
-                matches = list(cls.INPUT_INCLUDE_PATTERN.finditer(clean_line))
 
-                if not matches:
-                    output_lines.append(line)
-                    continue
+            try:
+                for line in content.splitlines(keepends=True):
+                    clean_line = cls.strip_comments(line)
+                    matches = list(cls.INPUT_INCLUDE_PATTERN.finditer(clean_line))
 
-                # If there are \input or \include commands in the non-comment part
-                last_idx = 0
-                line_parts = []
-                for match in matches:
-                    start_char = match.start()
-                    end_char = match.end()
-                    target_str = match.group(1).strip()
+                    if not matches:
+                        output_lines.append(line)
+                        continue
 
-                    # Keep text before match
-                    line_parts.append(clean_line[last_idx:start_char])
-                    last_idx = end_char
+                    last_idx = 0
+                    line_parts = []
+                    for match in matches:
+                        start_char = match.start()
+                        end_char = match.end()
 
-                    resolved_path = cls.resolve_include_path(
-                        curr_dir, version_dir, target_str
-                    )
-                    if resolved_path:
-                        inlined_child = inline_recursive(resolved_path)
-                        line_parts.append(
-                            f"\n% --- BEGIN INPUT: {resolved_path.name} ---\n"
-                            f"{inlined_child}\n"
-                            f"% --- END INPUT: {resolved_path.name} ---\n"
+                        cmd_type = match.group(1) or match.group(3) or match.group(5)
+                        target_str = (match.group(2) or match.group(4) or match.group(6) or "").strip()
+
+                        line_parts.append(clean_line[last_idx:start_char])
+                        last_idx = end_char
+
+                        # Check \includeonly constraint for \include commands
+                        if cmd_type == "include" and includeonly_set is not None:
+                            norm_target = target_str.replace("\\", "/").strip('"\'')
+                            if norm_target.lower().endswith(".tex"):
+                                norm_target = norm_target[:-4]
+                            if (norm_target not in includeonly_set and 
+                                norm_target.lower() not in includeonly_set):
+                                # Excluded by \includeonly: skip inlining
+                                line_parts.append(
+                                    f"\n% [Excluded by \\includeonly: {target_str}]\n"
+                                )
+                                continue
+
+                        resolved_path = cls.resolve_include_path(
+                            curr_dir, version_dir, target_str
                         )
-                    else:
-                        # Could not resolve file: keep original line comment
-                        line_parts.append(
-                            f"\n% [Unresolved include: {target_str}]\n"
-                        )
+                        if resolved_path:
+                            inlined_child = inline_recursive(resolved_path)
+                            line_parts.append(
+                                f"\n% --- BEGIN {cmd_type.upper()}: {resolved_path.name} ---\n"
+                                f"{inlined_child}\n"
+                                f"% --- END {cmd_type.upper()}: {resolved_path.name} ---\n"
+                            )
+                        else:
+                            unresolved_includes.append(target_str)
+                            line_parts.append(
+                                f"\n% [Unresolved include: {target_str}]\n"
+                            )
 
-                line_parts.append(clean_line[last_idx:])
-                output_lines.append("".join(line_parts) + "\n")
+                    line_parts.append(clean_line[last_idx:])
+                    output_lines.append("".join(line_parts) + "\n")
+            finally:
+                call_stack.pop()
 
             return "".join(output_lines)
 
@@ -313,13 +374,35 @@ class MultiFileGatherer:
             f.resolve() for f in all_tex_files if f.resolve() not in compilation_set
         ]
 
+        # Incomplete if any include was unresolved, had a cycle, or failed to read
+        is_complete = (
+            len(unresolved_includes) == 0
+            and len(cycle_errors) == 0
+            and len(read_errors) == 0
+        )
+
+        error_msg = None
+        if not is_complete:
+            err_parts = []
+            if unresolved_includes:
+                err_parts.append(f"{len(unresolved_includes)} unresolved includes ({', '.join(unresolved_includes[:3])})")
+            if cycle_errors:
+                err_parts.append(f"{len(cycle_errors)} cycles ({', '.join(cycle_errors[:2])})")
+            if read_errors:
+                err_parts.append(f"{len(read_errors)} read errors")
+            error_msg = f"Incomplete gathering: {'; '.join(err_parts)}"
+
         return {
-            "success": True,
+            "success": is_complete,
+            "is_complete": is_complete,
             "root_file": root_file,
             "compilation_files": compilation_files,
             "orphan_files": orphan_files,
             "inlined_content": inlined_content,
-            "error": None,
+            "unresolved_includes": unresolved_includes,
+            "cycle_errors": cycle_errors,
+            "read_errors": read_errors,
+            "error": error_msg,
         }
 
     @classmethod
@@ -342,7 +425,6 @@ class MultiFileGatherer:
         if not keep_root:
             files_to_delete.update(compilation_files)
         else:
-            # Delete all included compilation files except root
             if compilation_files:
                 files_to_delete.update(compilation_files[1:])
 
@@ -354,7 +436,6 @@ class MultiFileGatherer:
             except Exception:
                 pass
 
-        # Clean empty subdirectories in version_dir
         for root, dirs, files in os.walk(version_dir, topdown=False):
             for d in dirs:
                 dir_path = Path(root) / d
