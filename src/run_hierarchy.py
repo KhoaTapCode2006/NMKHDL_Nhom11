@@ -67,6 +67,7 @@ def process_publication_hierarchy(pub_dir: Path) -> Dict[str, Any]:
 
     tex_versions_count = 0
     empty_versions_count = 0
+    failed_versions_count = 0
 
     for v_name in version_names:
         v_dir = pub_dir / v_name
@@ -98,19 +99,44 @@ def process_publication_hierarchy(pub_dir: Path) -> Dict[str, Any]:
             }
 
         if not inlined_tex:
-            # Ghi nhận tường minh version rỗng (Empty Record) khi không có file .tex
-            empty_versions_count += 1
-            err_msg = (
-                gather_res.get("error")
-                if gather_res
-                else "Không tìm thấy file .tex trong thư mục version (empty record)"
-            )
+            # Phân biệt rõ: Version rỗng thật sự (0 file .tex) vs Lỗi Gather/Parse (có file .tex nhưng lỗi)
+            tex_files_found = []
+            if v_dir.is_dir():
+                tex_files_found = list(v_dir.glob("**/*.tex"))
+            elif (elements_dir / v_name).is_dir():
+                tex_files_found = list((elements_dir / v_name).glob("**/*.tex"))
+
+            has_tex = len(tex_files_found) > 0
+
+            if has_tex:
+                # CÓ file .tex nhưng gather thất bại -> Tính là Lỗi (failed)
+                failed_versions_count += 1
+                v_status = "failed"
+                is_empty_val = False
+                orphan_list = [f.name for f in tex_files_found]
+                err_msg = (
+                    gather_res.get("error")
+                    if gather_res and gather_res.get("error")
+                    else "Lỗi nhận diện file gốc hoặc gom file .tex thất bại"
+                )
+            else:
+                # KHÔNG có file .tex nào -> Bản ghi rỗng chuẩn theo đề bài (empty_version)
+                empty_versions_count += 1
+                v_status = "empty_version"
+                is_empty_val = True
+                orphan_list = []
+                err_msg = (
+                    gather_res.get("error")
+                    if gather_res and gather_res.get("error")
+                    else "Không tìm thấy file .tex trong thư mục version (empty record)"
+                )
+
             compilation_manifest[v_name] = {
-                "status": "empty_version",
-                "is_empty": True,
+                "status": v_status,
+                "is_empty": is_empty_val,
                 "root_file": None,
                 "compilation_files": [],
-                "orphan_files": [],
+                "orphan_files": orphan_list,
                 "error": err_msg,
             }
             v_out = HierarchyBuilder.build_version_hierarchy_outputs(
@@ -118,19 +144,20 @@ def process_publication_hierarchy(pub_dir: Path) -> Dict[str, Any]:
                 version_name=v_name,
                 raw_elements=[],
                 raw_hierarchy=[],
-                is_empty=True,
+                is_empty=is_empty_val,
                 error_msg=err_msg,
+                status=v_status,
             )
             version_records[v_name] = v_out
             preserved_references_by_version[v_name] = {
-                "status": "empty_version",
+                "status": v_status,
                 "thebibliography_blocks": [],
                 "bibitem_entries": [],
                 "bibliography_commands": [],
                 "reference_sections": [],
             }
 
-            # Lưu bản ghi cây rỗng vào thư mục version và elements/
+            # Lưu bản ghi cây rỗng/lỗi vào thư mục version và elements/
             if v_dir.is_dir():
                 (v_dir / "hierarchy_tree.json").write_text(
                     json.dumps(v_out["tree"], ensure_ascii=False, indent=2),
@@ -143,24 +170,54 @@ def process_publication_hierarchy(pub_dir: Path) -> Dict[str, Any]:
             continue
 
         # Phân tích version và dựng cây phân cấp (giữ nguyên Raw Content)
-        tex_versions_count += 1
-        raw_elems, raw_hier, preserved_refs = HierarchyBuilder.parse_version(
-            arxiv_id=arxiv_id,
-            version=v_name,
-            inlined_tex=inlined_tex,
-        )
-        raw_version_data[v_name] = (raw_elems, raw_hier)
-        preserved_references_by_version[v_name] = preserved_refs
+        try:
+            raw_elems, raw_hier, preserved_refs = HierarchyBuilder.parse_version(
+                arxiv_id=arxiv_id,
+                version=v_name,
+                inlined_tex=inlined_tex,
+            )
+            tex_versions_count += 1
+            raw_version_data[v_name] = (raw_elems, raw_hier)
+            preserved_references_by_version[v_name] = preserved_refs
 
-        # Tạo dữ liệu elements, danh sách cạnh và cây phân cấp cho version hiện tại
-        v_out = HierarchyBuilder.build_version_hierarchy_outputs(
-            arxiv_id=arxiv_id,
-            version_name=v_name,
-            raw_elements=raw_elems,
-            raw_hierarchy=raw_hier,
-            is_empty=False,
-        )
-        version_records[v_name] = v_out
+            # Tạo dữ liệu elements, danh sách cạnh và cây phân cấp cho version hiện tại
+            v_out = HierarchyBuilder.build_version_hierarchy_outputs(
+                arxiv_id=arxiv_id,
+                version_name=v_name,
+                raw_elements=raw_elems,
+                raw_hierarchy=raw_hier,
+                is_empty=False,
+                status="success",
+            )
+            version_records[v_name] = v_out
+        except Exception as e:
+            failed_versions_count += 1
+            err_msg = f"Lỗi dựng cây phân cấp: {e}"
+            compilation_manifest[v_name] = {
+                "status": "failed",
+                "is_empty": False,
+                "root_file": None,
+                "compilation_files": [],
+                "orphan_files": [],
+                "error": err_msg,
+            }
+            v_out = HierarchyBuilder.build_version_hierarchy_outputs(
+                arxiv_id=arxiv_id,
+                version_name=v_name,
+                raw_elements=[],
+                raw_hierarchy=[],
+                is_empty=False,
+                error_msg=err_msg,
+                status="failed",
+            )
+            version_records[v_name] = v_out
+            preserved_references_by_version[v_name] = {
+                "status": "failed",
+                "thebibliography_blocks": [],
+                "bibitem_entries": [],
+                "bibliography_commands": [],
+                "reference_sections": [],
+            }
 
         # Lưu cây phân cấp vào `<pub_dir>/<v_name>/hierarchy_tree.json` và `<pub_dir>/elements/`
         if v_dir.is_dir():
@@ -224,6 +281,7 @@ def process_publication_hierarchy(pub_dir: Path) -> Dict[str, Any]:
         "total_versions": len(version_names),
         "tex_versions": tex_versions_count,
         "empty_versions": empty_versions_count,
+        "failed_versions": failed_versions_count,
         "elements_count": len(dedup_res["elements"]),
         "hierarchy_edges_count": len(dedup_res["hierarchy"]),
         "dedup_stats": dedup_res["stats"],
@@ -278,6 +336,7 @@ def main():
     total_edges = 0
     total_tex_v = 0
     total_empty_v = 0
+    total_failed_v = 0
 
     for idx, p_dir in enumerate(pub_dirs, 1):
         res = process_publication_hierarchy(p_dir)
@@ -285,16 +344,22 @@ def main():
         total_edges += res["hierarchy_edges_count"]
         total_tex_v += res["tex_versions"]
         total_empty_v += res["empty_versions"]
+        total_failed_v += res["failed_versions"]
+        status_parts = [f"{res['tex_versions']} có TeX"]
+        if res["empty_versions"] > 0:
+            status_parts.append(f"{res['empty_versions']} rỗng")
+        if res["failed_versions"] > 0:
+            status_parts.append(f"{res['failed_versions']} lỗi (failed)")
         print(
             f"[{idx:02d}/{len(pub_dirs):02d}] {res['arxiv_id']} | "
-            f"versions: {res['tex_versions']} có TeX, {res['empty_versions']} rỗng | "
+            f"versions: {', '.join(status_parts)} | "
             f"elements: {res['elements_count']} | cạnh: {res['hierarchy_edges_count']}"
         )
 
     elapsed = time.perf_counter() - start_time
     print("=" * 68)
     print(f"  Hoàn thành {len(pub_dirs)} bài báo trong {elapsed:.2f}s")
-    print(f"  Tổng số version: {total_tex_v} có TeX, {total_empty_v} bản ghi rỗng (Empty Records)")
+    print(f"  Tổng số version: {total_tex_v} thành công (có TeX), {total_empty_v} bản ghi rỗng (Empty Records), {total_failed_v} lỗi (Failed)")
     print(f"  Tổng số Elements: {total_elems} | Tổng số cạnh Hierarchy: {total_edges}")
     print("=" * 68)
 
