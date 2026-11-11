@@ -736,7 +736,7 @@ class HierarchyBuilder:
 
         # 6. Tách câu tại dấu [.!?] (kể cả khi theo sau dấu chấm là dấu đóng ngoặc/nháy hoặc lệnh \footnote/\cite)
         work_with_breaks = re.sub(
-            r"([.!?](?:[\)\]\'\"]+|__CMD_\d+__)*)\s+(?=[A-Za-z0-9\(\[\"\'\\]|__(?:MATH|INLMATH|CMD|ABBR|URL)_)",
+            r"([.!?](?:[\)\]\'\"]+|__CMD_\d+__)*)\s+(?=[\w\(\[\"\'\\]|__(?:MATH|INLMATH|CMD|ABBR|URL)_)",
             r"\1\n__SENT_BREAK__\n",
             work,
         )
@@ -1160,14 +1160,38 @@ class HierarchyBuilder:
         raw_hierarchy: List[Dict[str, Any]],
         is_empty: bool = False,
         error_msg: Optional[str] = None,
+        status: str = "success",
     ) -> Dict[str, Any]:
         """
         Chuẩn hóa ID cho từng version (`<arxiv_id>#root1`, `<arxiv_id>#v1_s1`...)
-        và tạo cấu trúc cây lồng nhau. Nếu version rỗng thì ghi nhận Empty Record.
+        và tạo cấu trúc cây lồng nhau. Phân biệt rõ giữa version rỗng (empty_version)
+        và version bị lỗi gather/parse (failed).
         """
         v_num = int(version_name[1:]) if version_name.startswith("v") and version_name[1:].isdigit() else int(version_name)
 
-        if is_empty or not raw_elements:
+        if status == "failed":
+            return {
+                "arxiv_id": arxiv_id,
+                "version": v_num,
+                "version_name": version_name,
+                "status": "failed",
+                "is_empty": False,
+                "error": error_msg or "Lỗi gather/parse mã nguồn TeX cho version này",
+                "elements": [],
+                "hierarchy": [],
+                "tree": {
+                    "arxiv_id": arxiv_id,
+                    "version": v_num,
+                    "version_name": version_name,
+                    "status": "failed",
+                    "is_empty": False,
+                    "elements_count": 0,
+                    "edges_count": 0,
+                    "root": None,
+                },
+            }
+
+        if is_empty or status == "empty_version" or not raw_elements:
             return {
                 "arxiv_id": arxiv_id,
                 "version": v_num,
