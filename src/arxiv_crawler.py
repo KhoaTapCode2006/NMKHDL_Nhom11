@@ -9,16 +9,24 @@ import os
 import requests
 from pathlib import Path, PurePosixPath
 import urllib.request
-from urllib.error import HTTPError
 from dotenv import load_dotenv
 import http.client
+import threading
+import zlib
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 YEAR_MONTH = "2510"  
 START_SEQ = 10788
-END_SEQ = 10837
-INTERVAL = 3.1
+END_SEQ = 10807
+REFERENCE_REQUEST_INTERVAL = 5.0
+REFERENCE_BACKOFF_BASE = 10.0
+REFERENCE_BACKOFF_MAX = 120.0
+REFERENCE_MAX_RETRIES = 10
+_reference_next_request_at = 0.0
+_reference_request_lock = threading.Lock()
 
 all_target_ids = [f"{YEAR_MONTH}.{seq:05d}" for seq in range(START_SEQ, END_SEQ + 1)]
 
@@ -40,7 +48,7 @@ def save_json_file(data: dict | list, file_path: Path):
 def build_paper_metadata(paper, versioned_arxiv_id: str) -> dict:
     return {
         "arxiv_id": versioned_arxiv_id,
-        "title": paper.title.strip().replace("\n", " "),
+        "title": re.sub(r"\s+", " ", paper.title).strip(),
         "authors": [author.name for author in paper.authors],
         "version": versioned_arxiv_id.rsplit("v", 1)[-1],
         "submission_date": paper.published.isoformat() if paper.published else None,
@@ -50,7 +58,48 @@ def build_paper_metadata(paper, versioned_arxiv_id: str) -> dict:
         "categories": paper.categories
     }
 
-def get_paper_references(arxiv_id: str) -> list[dict]:
+
+def _wait_for_reference_request(minimum_delay: float = 0.0) -> None:
+    """Wait until the next request slot using a monotonic deadline."""
+    global _reference_next_request_at
+
+    with _reference_request_lock:
+        deadline = max(
+            _reference_next_request_at,
+            time.monotonic() + max(0.0, minimum_delay),
+        )
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(remaining)
+
+        _reference_next_request_at = time.monotonic() + REFERENCE_REQUEST_INTERVAL
+
+
+def _retry_after_seconds(response: requests.Response) -> float:
+    """Parse Retry-After as either seconds or an HTTP date."""
+    value = response.headers.get("Retry-After", "").strip()
+    if not value:
+        return 0.0
+
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(
+            0.0,
+            (retry_at - datetime.now(timezone.utc)).total_seconds(),
+        )
+
+
+def get_paper_references(arxiv_id: str) -> list[dict] | None:
     if not API_KEY:
         raise RuntimeError("API_KEY is missing. Set it in the .env file.")
 
@@ -62,26 +111,55 @@ def get_paper_references(arxiv_id: str) -> list[dict]:
             "references.authors,references.year"
         )
     }
-    api_key = API_KEY
-    headers = {"x-api-key": api_key}
-    
-    max_retries = 10
-    
-    for attempt in range(max_retries):
-        response = requests.get(url, params=params, headers=headers, timeout=30)
-        
-        if response.status_code == 429:
-            wait_time = INTERVAL * (attempt + 2)
-            print(f"Lỗi 429 cho {arxiv_id}. Đang chờ {wait_time}s để thử lại ({attempt + 1}/{max_retries})...")
-            time.sleep(wait_time)
+    headers = {"x-api-key": API_KEY}
+    retry_delay = 0.0
+
+    for attempt in range(REFERENCE_MAX_RETRIES):
+        _wait_for_reference_request(retry_delay)
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=30)
+        except requests.RequestException as exc:
+            if attempt + 1 == REFERENCE_MAX_RETRIES:
+                print(
+                    f"Skipping {arxiv_id} after repeated reference request errors: "
+                    f"{type(exc).__name__}."
+                )
+                return None
+
+            retry_delay = min(
+                REFERENCE_BACKOFF_BASE * (2**attempt),
+                REFERENCE_BACKOFF_MAX,
+            )
+            print(
+                f"Reference request error for {arxiv_id} "
+                f"({type(exc).__name__}); retrying in {retry_delay:.1f}s "
+                f"({attempt + 1}/{REFERENCE_MAX_RETRIES})."
+            )
             continue
-            
+
+        if response.status_code == 429 or response.status_code >= 500:
+            if attempt + 1 == REFERENCE_MAX_RETRIES:
+                print(f"Skipping {arxiv_id} after repeated HTTP {response.status_code}.")
+                return None
+
+            exponential_backoff = min(
+                REFERENCE_BACKOFF_BASE * (2**attempt),
+                REFERENCE_BACKOFF_MAX,
+            )
+            retry_delay = max(
+                exponential_backoff,
+                _retry_after_seconds(response),
+            )
+            print(
+                f"HTTP {response.status_code} for {arxiv_id}; "
+                f"retrying in {retry_delay:.1f}s "
+                f"({attempt + 1}/{REFERENCE_MAX_RETRIES})."
+            )
+            continue
+
         response.raise_for_status()
-        
-        time.sleep(INTERVAL)
         return response.json().get("references") or []
-        
-    print(f"Skipping {arxiv_id} persistent 429.")
+
     return None
 
 
@@ -134,31 +212,40 @@ def get_source(
         headers={"User-Agent": "NMKHDL-Nhom11 arXiv source crawler"},
     )
     archive_bytes = b""
+    download_succeeded = False
+    source_not_found = False
+    download_error = None
     max_download_retries = 3
     
     for attempt in range(max_download_retries):
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
                 archive_bytes = response.read()
+            download_succeeded = True
             time.sleep(3)
-            break  # Nếu tải thành công, thoát khỏi vòng lặp
+            break
             
         except http.client.IncompleteRead as e:
+            download_error = f"IncompleteRead: {e}"
             print(f"Đứt kết nối giữa chừng (IncompleteRead) tải {versioned_arxiv_id}. Thử lại ({attempt + 1}/{max_download_retries})...")
             time.sleep(3)
             
         except urllib.error.HTTPError as error:
             if error.code == 404:
-                archive_bytes = b""
+                source_not_found = True
+                download_error = None
                 time.sleep(3)
-                break  # Bỏ qua retry nếu file thực sự không tồn tại
+                break
             elif error.code in (429, 500, 502, 503, 504):
+                download_error = f"HTTP {error.code}: {error.reason}"
                 print(f"Lỗi server {error.code} khi tải {versioned_arxiv_id}. Thử lại ({attempt + 1}/{max_download_retries})...")
                 time.sleep(5)
             else:
-                raise  # Văng lỗi nếu là các mã HTTP khác
+                download_error = f"HTTP {error.code}: {error.reason}"
+                break
                 
         except Exception as e:
+            download_error = f"{type(e).__name__}: {e}"
             print(f"Lỗi mạng ({type(e).__name__}) tải {versioned_arxiv_id}. Thử lại ({attempt + 1}/{max_download_retries})...")
             time.sleep(3)
 
@@ -167,8 +254,11 @@ def get_source(
     total_uncompressed_bytes = 0
     filtered_uncompressed_bytes = 0
     raw_archive_bytes = len(archive_bytes) if archive_bytes else 0
+    archive_error = None
 
-    if archive_bytes:
+    if download_succeeded and not archive_bytes:
+        archive_error = "Source endpoint returned an empty response"
+    elif download_succeeded and archive_bytes:
         try:
             archive = tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*")
         except tarfile.ReadError:
@@ -210,15 +300,25 @@ def get_source(
                     output_path.write_bytes(data)
                     tex_files.append("main.tex")
                     filtered_uncompressed_bytes = len(data)
-            except Exception:
-                pass
+                else:
+                    archive_error = "Downloaded archive is not a recognized TeX source"
+            except (OSError, EOFError, zlib.error) as error:
+                archive_error = f"Invalid source archive: {error}"
 
     metadata["raw_archive_bytes"] = raw_archive_bytes
     metadata["total_uncompressed_bytes"] = total_uncompressed_bytes
     metadata["filtered_uncompressed_bytes"] = filtered_uncompressed_bytes
     metadata["references_status"] = "success" if isinstance(references, list) else "failed"
     metadata["references_count"] = len(references) if isinstance(references, list) else 0
-    metadata["source_status"] = "downloaded" if tex_files or bib_files else "no_tex_or_bib"
+    if tex_files or bib_files:
+        metadata["source_status"] = "downloaded"
+    elif source_not_found:
+        metadata["source_status"] = "no_tex_or_bib"
+    elif download_error or archive_error or not download_succeeded:
+        metadata["source_status"] = "download_failed"
+        metadata["download_error"] = download_error or archive_error or "Download failed"
+    else:
+        metadata["source_status"] = "no_tex_or_bib"
     save_json_file(metadata, metadata_path)
     return {
         "paper_dir": str(paper_dir),
@@ -229,6 +329,7 @@ def get_source(
         "total_uncompressed_bytes": total_uncompressed_bytes,
         "filtered_uncompressed_bytes": filtered_uncompressed_bytes,
         "source_status": metadata["source_status"],
+        "error": metadata.get("download_error"),
     }
 
 
@@ -279,7 +380,3 @@ if __name__ == "__main__":
                     paper=paper,
                     references=references,
                 )
-
-
-
-

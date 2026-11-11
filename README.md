@@ -33,3 +33,16 @@ The project uses two complementary approaches: the arXiv crawler and the OAI-bas
 | Output | Paper metadata, version folders, references | Structured metadata records, identifiers, harvesting state |
 
 This table is a practical sample comparison. In practice, both crawler types can be used together to achieve precise control over a target set and broader repository visibility.
+
+## 7. Build and normalize hierarchy trees
+
+After gathering and building the hierarchy for the publication folders, run:
+
+```powershell
+python src\run_hierarchy.py --source-dir src\sourcesArxiv
+python src\run_normalizer.py --source-dir src\sourcesArxiv
+```
+
+`run_hierarchy.py` writes the per-version BibTeX conversions from `\bibitem`
+references under each publication's `elements/` folder as `references_vN.bib`.
+`run_normalizer.py` normalizes each version's existing hierarchy tree in place.

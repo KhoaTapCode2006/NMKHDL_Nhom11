@@ -11,11 +11,12 @@ Script chạy xây dựng cây phân cấp (Hierarchy Construction - Phần củ
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 curr_dir = Path(__file__).resolve().parent
 if str(curr_dir) not in sys.path:
@@ -51,6 +52,35 @@ def process_publication_hierarchy(pub_dir: Path) -> Dict[str, Any]:
     else:
         version_names = [vd.name for vd in version_dirs]
 
+    version_inputs: Dict[str, Any] = {}
+    references_by_version: Dict[str, List[Dict[str, str]]] = {}
+    for v_name in version_names:
+        v_dir = pub_dir / v_name
+        meta = None
+        meta_p = v_dir / "metadata.json"
+        if meta_p.is_file():
+            try:
+                meta = json.loads(meta_p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        inlined_tex, gather_res = HierarchyBuilder.load_version_tex_from_elements_or_source(
+            pub_dir=pub_dir,
+            version_name=v_name,
+            metadata=meta,
+        )
+        version_inputs[v_name] = (meta, inlined_tex, gather_res)
+        references_by_version[v_name] = (
+            HierarchyBuilder.extract_bibitems(inlined_tex)
+            if inlined_tex
+            else []
+        )
+
+    reference_result = HierarchyBuilder.deduplicate_references_by_version(
+        arxiv_id,
+        references_by_version,
+    )
+
     raw_version_data: Dict[str, Any] = {}
     preserved_references_by_version: Dict[str, Any] = {}
     version_records: Dict[str, Any] = {}
@@ -70,25 +100,10 @@ def process_publication_hierarchy(pub_dir: Path) -> Dict[str, Any]:
 
     for v_name in version_names:
         v_dir = pub_dir / v_name
-        meta = None
-        meta_p = v_dir / "metadata.json"
-        if meta_p.is_file():
-            try:
-                meta = json.loads(meta_p.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-
-        inlined_tex, gather_res = HierarchyBuilder.load_version_tex_from_elements_or_source(
-            pub_dir=pub_dir,
-            version_name=v_name,
-            metadata=meta,
-        )
+        meta, inlined_tex, gather_res = version_inputs[v_name]
 
         # Lưu lại file LaTeX đã gộp vào elements/ nếu vừa mới gom
         if inlined_tex and gather_res:
-            inlined_path = elements_dir / f"full_inlined_{v_name}.tex"
-            if not inlined_path.is_file():
-                inlined_path.write_text(inlined_tex, encoding="utf-8")
             compilation_manifest[v_name] = {
                 "status": "success",
                 "is_empty": False,
@@ -142,6 +157,15 @@ def process_publication_hierarchy(pub_dir: Path) -> Dict[str, Any]:
             )
             continue
 
+        inlined_tex = HierarchyBuilder.remap_citation_keys(
+            inlined_tex,
+            reference_result["aliases_by_version"].get(v_name, {}),
+        )
+        (elements_dir / f"full_inlined_{v_name}.tex").write_text(
+            inlined_tex,
+            encoding="utf-8",
+        )
+
         # Phân tích version và dựng cây phân cấp (giữ nguyên Raw Content)
         tex_versions_count += 1
         raw_elems, raw_hier, preserved_refs = HierarchyBuilder.parse_version(
@@ -186,6 +210,36 @@ def process_publication_hierarchy(pub_dir: Path) -> Dict[str, Any]:
         json.dumps(preserved_references_by_version, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    for v_name, entries in reference_result["bibtex_by_version"].items():
+        bibtex_path = elements_dir / f"references_{v_name}.bib"
+        bibtex_path.write_text(
+            "\n\n".join(entries) + ("\n" if entries else ""),
+            encoding="utf-8",
+        )
+    bibtex_json_path = elements_dir / "bibtex.json"
+    bibtex_json_path.write_text(
+        json.dumps(reference_result["entries"], ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    bibtex_csv_path = elements_dir / "bibtex.csv"
+    bibtex_fields = [
+        "arxiv_id",
+        "citation_key",
+        "entry_type",
+        "title",
+        "authors",
+        "year",
+        "doi",
+        "journal",
+        "url",
+    ]
+    with bibtex_csv_path.open("w", encoding="utf-8-sig", newline="") as bibtex_csv:
+        writer = csv.DictWriter(bibtex_csv, fieldnames=bibtex_fields)
+        writer.writeheader()
+        for entry in reference_result["entries"]:
+            row = dict(entry)
+            row["authors"] = json.dumps(row["authors"], ensure_ascii=False)
+            writer.writerow(row)
 
     # Cập nhật manifest (bao gồm cả trạng thái version rỗng)
     manifest_path.write_text(
@@ -226,6 +280,7 @@ def process_publication_hierarchy(pub_dir: Path) -> Dict[str, Any]:
         "empty_versions": empty_versions_count,
         "elements_count": len(dedup_res["elements"]),
         "hierarchy_edges_count": len(dedup_res["hierarchy"]),
+        "bibtex_entries_count": len(reference_result["entries"]),
         "dedup_stats": dedup_res["stats"],
     }
 

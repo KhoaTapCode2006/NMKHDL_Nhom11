@@ -182,6 +182,514 @@ class HierarchyBuilder:
         return body, preserved_refs
 
     @classmethod
+    def extract_bibitems(cls, raw_tex: str) -> List[Dict[str, str]]:
+        """Extract keyed ``\\bibitem`` records from one TeX document."""
+        text = cls.strip_comments(raw_tex)
+        document = re.search(
+            r"\\begin\{document\}(.*?)(?:\\end\{document\}|$)",
+            text,
+            flags=re.DOTALL,
+        )
+        body = document.group(1) if document else text
+        pattern = re.compile(
+            r"\\bibitem\s*(?:\[(?P<label>[^\]]*)\])?\s*"
+            r"\{(?P<key>[^{}]+)\}",
+        )
+        matches = list(pattern.finditer(body))
+        references: List[Dict[str, str]] = []
+
+        for index, match in enumerate(matches):
+            next_start = (
+                matches[index + 1].start()
+                if index + 1 < len(matches)
+                else len(body)
+            )
+            content = body[match.end():next_start]
+            content = re.sub(
+                r"\\end\{(?:thebibliography|references|bibunit)\}\s*$",
+                "",
+                content,
+                flags=re.IGNORECASE,
+            ).strip()
+            references.append({
+                "citation_key": match.group("key").strip(),
+                "label": (match.group("label") or "").strip(),
+                "content": cls.normalize_whitespace_only(content),
+            })
+
+        return references
+
+    @staticmethod
+    def _read_braced_value(text: str, position: int) -> Tuple[str, int]:
+        """Read one balanced brace group, returning its value and end position."""
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text) or text[position] != "{":
+            return "", position
+
+        depth = 1
+        start = position + 1
+        position += 1
+        while position < len(text):
+            if text[position] in "{}":
+                backslashes = 0
+                cursor = position - 1
+                while cursor >= 0 and text[cursor] == "\\":
+                    backslashes += 1
+                    cursor -= 1
+                if backslashes % 2 == 0:
+                    if text[position] == "{":
+                        depth += 1
+                    else:
+                        depth -= 1
+                        if depth == 0:
+                            return text[start:position], position + 1
+            position += 1
+        return text[start:], len(text)
+
+    @classmethod
+    def _bibinfo_fields(cls, content: str) -> Dict[str, List[str]]:
+        """Read explicit BibTeX-style ``\\bibinfo{field}{value}`` metadata."""
+        fields: Dict[str, List[str]] = {}
+        for match in re.finditer(r"\\bibinfo\b", content):
+            field_name, field_end = cls._read_braced_value(content, match.end())
+            value, _ = cls._read_braced_value(content, field_end)
+            field_name = field_name.strip().lower()
+            if field_name and value:
+                fields.setdefault(field_name, []).append(value.strip())
+        return fields
+
+    @classmethod
+    def _plain_reference_text(cls, content: str) -> str:
+        """Remove common bibliography formatting commands while retaining their text."""
+        text = re.sub(r"\\newblock\b", " ", content)
+        text = re.sub(r"\\bibinfo\s*\{[^{}]*\}\s*", "", text)
+        text = re.sub(r"\\(?:emph|textit|textbf|textrm|mbox)\s*\{([^{}]*)\}", r"\1", text)
+        text = re.sub(r"\\url\s*\{([^{}]*)\}", r"\1", text)
+        text = re.sub(r"\\href\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"\2", text)
+        text = re.sub(r"\\[a-zA-Z]+\*?(?:\[[^\]]*\])?", "", text)
+        text = text.replace("{", "").replace("}", "")
+        return re.sub(r"\s+", " ", text).strip()
+
+    @classmethod
+    def _metadata_authors(cls, authors: str) -> List[str]:
+        authors = cls._plain_reference_text(authors).strip(" ,.;")
+        if not authors:
+            return []
+
+        conjunction_parts = re.split(r"\s+and\s+", authors, flags=re.IGNORECASE)
+        if len(conjunction_parts) > 1:
+            return [part.strip(" ,.;") for part in conjunction_parts if part.strip(" ,.;")]
+
+        comma_parts = [part.strip() for part in authors.split(",")]
+        if len(comma_parts) > 2 and all(
+            re.fullmatch(r"(?:[A-Z]\.\s*)?[A-Z][A-Za-z'’-]+(?:\s+[A-Z]\.)?", part)
+            for part in comma_parts
+        ):
+            return [part.strip(" ,.;") for part in comma_parts if part.strip(" ,.;")]
+        return [authors]
+
+    @staticmethod
+    def _looks_like_journal(value: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:journal|proceedings|transactions|conference|review|letters|"
+                r"annals|communications|ieee|acm|arxiv|nature|science|springer|"
+                r"elsevier|press)\b",
+                value,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def extract_reference_fields(
+        cls,
+        reference: Dict[str, str],
+        arxiv_id: str = "",
+    ) -> Dict[str, Any]:
+        """Extract only identifiable metadata, retaining source text in ``note`` for BibTeX."""
+        content = reference.get("content", "").strip()
+        explicit = cls._bibinfo_fields(content)
+
+        def explicit_value(name: str) -> Optional[str]:
+            values = explicit.get(name, [])
+            return cls._plain_reference_text(values[0]).strip(" ,.;") if values else None
+
+        title = explicit_value("title")
+        author_value = explicit_value("author") or explicit_value("authors")
+        journal = explicit_value("journal")
+        year_value = explicit_value("year")
+        doi = explicit_value("doi")
+        url = explicit_value("url")
+
+        plain = cls._plain_reference_text(content)
+
+        if author_value is None or title is None or journal is None:
+            blocks = [
+                cls._plain_reference_text(block).strip(" ,.;")
+                for block in re.split(r"\\newblock\b", content)
+            ]
+            blocks = [block for block in blocks if block]
+            if len(blocks) >= 2:
+                if author_value is None:
+                    author_value = blocks[0]
+                if title is None:
+                    title = blocks[1]
+                if (
+                    journal is None
+                    and len(blocks) >= 3
+                    and cls._looks_like_journal(blocks[2])
+                ):
+                    journal = blocks[2]
+
+        if title is None:
+            quoted_title = re.search(
+                r"``(?P<tex>.+?)''|“(?P<curly>.+?)”|\"(?P<plain>.+?)\"",
+                plain,
+            )
+            if quoted_title:
+                title = next(
+                    value
+                    for value in quoted_title.groupdict().values()
+                    if value is not None
+                ).strip(" ,.;")
+                if author_value is None:
+                    author_value = plain[:quoted_title.start()].strip(" ,.;")
+                trailing_text = plain[quoted_title.end():].strip(" ,;.")
+                if journal is None and cls._looks_like_journal(trailing_text):
+                    journal = trailing_text
+
+        if title is None:
+            protected_initials = re.sub(
+                r"\b([A-Z])\.(?=\s+[A-Z])",
+                r"\1<INITIAL>",
+                plain,
+            )
+            parts = [
+                part.replace("<INITIAL>", ".").strip(" ,;")
+                for part in re.split(r"(?<=[.!?])\s+", protected_initials)
+                if part.strip(" ,;.")
+            ]
+            if len(parts) >= 2:
+                candidate_authors = parts[0]
+                candidate_title = parts[1].strip(" .")
+                if (
+                    len(candidate_authors.split()) >= 2
+                    and len(candidate_title.split()) >= 2
+                ):
+                    if author_value is None:
+                        author_value = candidate_authors.strip(" .")
+                    title = candidate_title
+                    trailing_text = " ".join(parts[2:]).strip(" ,;.")
+                    if (
+                        journal is None
+                        and len(parts) >= 3
+                        and cls._looks_like_journal(trailing_text)
+                    ):
+                        journal = trailing_text
+
+        if not year_value:
+            year_match = re.search(r"\b(?:18|19|20|21)\d{2}\b", content)
+            year_value = year_match.group(0) if year_match else None
+        year = int(year_value) if year_value and year_value.isdigit() else None
+
+        if not doi:
+            doi_match = re.search(
+                r"\b10\.\d{4,9}/[^\s,;<>]+",
+                content,
+                flags=re.IGNORECASE,
+            )
+            doi = doi_match.group(0).rstrip(".,;:)}]") if doi_match else None
+        if not url:
+            url_match = re.search(r"https?://[^\s<>}]+", content)
+            url = url_match.group(0).rstrip(".,;:)]") if url_match else None
+
+        if journal:
+            journal = re.sub(r"\b(?:18|19|20|21)\d{2}\b", "", journal).strip(" ,;.")
+            journal = journal or None
+
+        authors = cls._metadata_authors(author_value or "")
+        return {
+            "arxiv_id": arxiv_id,
+            "citation_key": reference.get("citation_key", "").strip(),
+            "entry_type": "misc",
+            "title": title or None,
+            "authors": authors,
+            "year": year,
+            "doi": doi or None,
+            "journal": journal,
+            "url": url or None,
+        }
+
+    @staticmethod
+    def _bibtex_value(value: str) -> str:
+        """Wrap a value in braces and escape unmatched literal braces."""
+        value = re.sub(r"\s+", " ", value).strip()
+        unmatched_open: List[int] = []
+        unmatched_positions: set[int] = set()
+        for index, character in enumerate(value):
+            if character not in "{}":
+                continue
+            backslashes = 0
+            cursor = index - 1
+            while cursor >= 0 and value[cursor] == "\\":
+                backslashes += 1
+                cursor -= 1
+            if backslashes % 2:
+                continue
+            if character == "{":
+                unmatched_open.append(index)
+            elif unmatched_open:
+                unmatched_open.pop()
+            else:
+                unmatched_positions.add(index)
+        unmatched_positions.update(unmatched_open)
+        tex_specials = {"&", "%", "#", "$", "_"}
+        escaped_parts: List[str] = []
+        for index, character in enumerate(value):
+            prefix = "\\" if index in unmatched_positions else ""
+            if character in tex_specials:
+                backslashes = 0
+                cursor = index - 1
+                while cursor >= 0 and value[cursor] == "\\":
+                    backslashes += 1
+                    cursor -= 1
+                if backslashes % 2 == 0:
+                    prefix += "\\"
+            escaped_parts.append(prefix + character)
+        escaped = "".join(escaped_parts)
+        return "{" + escaped + "}"
+
+    @classmethod
+    def reference_to_bibtex(
+        cls,
+        record: Dict[str, Any],
+        note: str = "",
+    ) -> str:
+        """Serialize one structured reference as a syntactically valid BibTeX entry."""
+        citation_key = record["citation_key"]
+        if not re.fullmatch(r"[^\s{},]+", citation_key):
+            raise ValueError(f"Invalid BibTeX citation key: {citation_key!r}")
+
+        fields: List[Tuple[str, str]] = []
+        authors = record.get("authors") or []
+        if authors:
+            fields.append(("author", " and ".join(authors)))
+        for field in ("title", "journal", "year", "doi", "url"):
+            value = record.get(field)
+            if value is not None and value != "":
+                fields.append((field, str(value)))
+        if note:
+            fields.append(("note", note))
+
+        serialized_fields = [
+            f"  {field} = {cls._bibtex_value(value)}"
+            for field, value in fields
+        ]
+        if not serialized_fields:
+            serialized_fields.append("  note = {}")
+        return (
+            f"@{record.get('entry_type') or 'misc'}{{{citation_key},\n"
+            + ",\n".join(serialized_fields)
+            + "\n}"
+        )
+
+    @classmethod
+    def convert_references_to_bibtex(
+        cls, references: List[Dict[str, str]]
+    ) -> List[str]:
+        """Convert ``\\bibitem`` references into BibTeX, retaining the source in ``note``."""
+        entries = []
+        for index, reference in enumerate(references, start=1):
+            item = dict(reference)
+            item.setdefault("citation_key", f"reference_{index}")
+            record = cls.extract_reference_fields(item)
+            content = re.sub(r"\s+", " ", item.get("content", "")).strip()
+            label = item.get("label", "").strip()
+            note = f"[{label}] {content}" if label else content
+            entries.append(cls.reference_to_bibtex(record, note=note))
+        return entries
+
+    @classmethod
+    def deduplicate_references_by_version(
+        cls,
+        arxiv_id: str,
+        references_by_version: Dict[str, List[Dict[str, str]]],
+    ) -> Dict[str, Any]:
+        """Merge duplicate references across versions and build per-version key maps."""
+        records: List[Dict[str, Any]] = []
+        source_text_by_key: Dict[str, str] = {}
+        aliases_by_version: Dict[str, Dict[str, str]] = {}
+        version_keys: Dict[str, List[str]] = {}
+        title_indexes: Dict[str, List[int]] = {}
+        doi_indexes: Dict[str, int] = {}
+        fallback_indexes: Dict[str, int] = {}
+        key_indexes: Dict[str, int] = {}
+        version_notes: Dict[str, Dict[str, str]] = {}
+
+        def normalize_identity(value: str) -> str:
+            return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+        ordered_versions = sorted(
+            references_by_version,
+            key=lambda name: int(name[1:]) if name.startswith("v") and name[1:].isdigit() else int(name),
+        )
+        for version_name in ordered_versions:
+            aliases: Dict[str, str] = {}
+            version_keys[version_name] = []
+            version_notes[version_name] = {}
+            for reference_index, reference in enumerate(
+                references_by_version[version_name], start=1
+            ):
+                reference = dict(reference)
+                citation_key = reference.get("citation_key", "").strip()
+                if not citation_key:
+                    citation_key = f"reference_{reference_index}"
+                reference["citation_key"] = citation_key
+                content = reference.get("content", "")
+                record = cls.extract_reference_fields(reference, arxiv_id=arxiv_id)
+
+                title_identity = normalize_identity(record["title"] or "")
+                authors_identity = normalize_identity(" ".join(record["authors"]))
+                doi_identity = normalize_identity(record["doi"] or "")
+                fallback_text = re.sub(
+                    r"\b(?:18|19|20|21)\d{2}\b|"
+                    r"\b10\.\d{4,9}/[^\s,;<>]+|https?://[^\s<>]+",
+                    "",
+                    cls._plain_reference_text(content).lower(),
+                )
+                fallback_identity = normalize_identity(fallback_text)
+
+                duplicate_index = doi_indexes.get(doi_identity) if doi_identity else None
+                if duplicate_index is None and title_identity:
+                    for candidate_index in title_indexes.get(title_identity, []):
+                        existing_authors = normalize_identity(
+                            " ".join(records[candidate_index]["authors"])
+                        )
+                        if (
+                            not authors_identity
+                            or not existing_authors
+                            or authors_identity == existing_authors
+                        ):
+                            duplicate_index = candidate_index
+                            break
+                if (
+                    duplicate_index is None
+                    and not title_identity
+                    and not doi_identity
+                    and fallback_identity
+                ):
+                    duplicate_index = fallback_indexes.get(fallback_identity)
+
+                if duplicate_index is None:
+                    base_key = citation_key
+                    unique_key = base_key
+                    suffix = 2
+                    while unique_key in key_indexes:
+                        unique_key = f"{base_key}_{suffix}"
+                        suffix += 1
+                    record["citation_key"] = unique_key
+                    duplicate_index = len(records)
+                    records.append(record)
+                    source_text_by_key[unique_key] = content
+                    key_indexes[unique_key] = duplicate_index
+                else:
+                    existing = records[duplicate_index]
+                    unique_key = existing["citation_key"]
+                    for field in ("title", "year", "doi", "journal", "url"):
+                        if not existing[field] and record[field]:
+                            existing[field] = record[field]
+                    for author in record["authors"]:
+                        if normalize_identity(author) not in {
+                            normalize_identity(existing_author)
+                            for existing_author in existing["authors"]
+                        }:
+                            existing["authors"].append(author)
+                    if not title_identity and fallback_identity:
+                        fallback_indexes[fallback_identity] = duplicate_index
+
+                if title_identity:
+                    title_indexes.setdefault(title_identity, []).append(duplicate_index)
+                if doi_identity:
+                    doi_indexes[doi_identity] = duplicate_index
+                if fallback_identity:
+                    fallback_indexes.setdefault(fallback_identity, duplicate_index)
+
+                aliases[citation_key] = unique_key
+                label = reference.get("label", "").strip()
+                note = f"[{label}] {content}" if label else content
+                version_notes[version_name].setdefault(unique_key, note)
+                if unique_key not in version_keys[version_name]:
+                    version_keys[version_name].append(unique_key)
+            aliases_by_version[version_name] = aliases
+
+        records_by_key = {record["citation_key"]: record for record in records}
+        bibtex_by_version: Dict[str, List[str]] = {}
+        for version_name, keys in version_keys.items():
+            bibtex_by_version[version_name] = [
+                cls.reference_to_bibtex(
+                    records_by_key[key],
+                    note=version_notes[version_name].get(
+                        key,
+                        source_text_by_key.get(key, ""),
+                    ),
+                )
+                for key in keys
+            ]
+
+        return {
+            "entries": records,
+            "aliases_by_version": aliases_by_version,
+            "bibtex_by_version": bibtex_by_version,
+        }
+
+    @classmethod
+    def remap_citation_keys(cls, text: str, aliases: Dict[str, str]) -> str:
+        """Replace citation aliases in TeX commands while leaving comments unchanged."""
+        if not aliases:
+            return text
+
+        pattern = re.compile(
+            r"(?P<comment>(?<!\\)(?:\\\\)*%[^\n]*)|"
+            r"(?P<citation>\\[a-zA-Z@]*cite[a-zA-Z@]*\*?"
+            r"(?:\s*\[[^\]]*\]){0,2}\s*\{[^{}]*\})",
+            flags=re.IGNORECASE,
+        )
+
+        def replace(match: re.Match) -> str:
+            citation = match.group("citation")
+            if not citation:
+                return match.group(0)
+            brace_start = citation.find("{")
+            key_list = citation[brace_start + 1:-1]
+            keys = [
+                aliases.get(key.strip(), key.strip())
+                for key in key_list.split(",")
+            ]
+            return citation[:brace_start + 1] + ", ".join(keys) + "}"
+
+        return pattern.sub(replace, text)
+
+    @classmethod
+    def extract_references_from_version(
+        cls,
+        pub_dir: Path,
+        version_name: str,
+        metadata: Optional[dict] = None,
+    ) -> List[str]:
+        """Load a version from ``elements/`` or its source directory and convert references."""
+        inlined_tex, _ = cls.load_version_tex_from_elements_or_source(
+            Path(pub_dir),
+            version_name,
+            metadata=metadata,
+        )
+        if not inlined_tex:
+            return []
+        return cls.convert_references_to_bibtex(
+            cls.extract_bibitems(inlined_tex)
+        )
+
+    @classmethod
     def split_sentences_safe(cls, text: str) -> List[str]:
         """
         Tách văn bản thành các câu (sentence) bằng kỹ thuật che token (masking):
