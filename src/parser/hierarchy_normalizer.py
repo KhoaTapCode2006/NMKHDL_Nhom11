@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import re
 from pathlib import Path
@@ -20,9 +19,7 @@ class HierarchyNormalizer:
         "eqnarray\\*?|flalign\\*?|displaymath"
     )
     BLOCK_MATH_PATTERN = re.compile(
-        rf"\\begin\{{(?P<env>{BLOCK_MATH_ENVIRONMENTS})\}}"
-        rf"(?P<body>.*?)"
-        rf"\\end\{{(?P=env)\}}",
+        rf"\\(?P<action>begin|end)\{{(?P<env>{BLOCK_MATH_ENVIRONMENTS})\}}",
         re.DOTALL,
     )
 
@@ -32,16 +29,45 @@ class HierarchyNormalizer:
         normalized = HierarchyExtractor.standardize_math(content)
 
         if kind == "block_formula":
-            normalized = cls.BLOCK_MATH_PATTERN.sub(
-                lambda match: (
-                    "\\begin{equation}\n"
-                    f"{match.group('body').strip()}\n"
-                    "\\end{equation}"
-                ),
-                normalized,
-            )
+            normalized = cls._normalize_block_math_environments(normalized)
 
         return HierarchyExtractor.clean_latex(normalized)
+
+    @classmethod
+    def _normalize_block_math_environments(cls, content: str) -> str:
+        """Normalize matched, non-nested display environments without mispairing tags."""
+        stack: List[Dict[str, Any]] = []
+        replacements: List[tuple[int, int, str]] = []
+
+        for match in cls.BLOCK_MATH_PATTERN.finditer(content):
+            env = match.group("env")
+            if match.group("action") == "begin":
+                for parent in stack:
+                    parent["contains_nested_math"] = True
+                stack.append(
+                    {
+                        "env": env,
+                        "start": match.start(),
+                        "body_start": match.end(),
+                        "contains_nested_math": bool(stack),
+                    }
+                )
+                continue
+
+            if not stack or stack[-1]["env"] != env:
+                continue
+
+            frame = stack.pop()
+            if frame["contains_nested_math"]:
+                continue
+
+            body = content[frame["body_start"]:match.start()].strip()
+            replacement = f"\\begin{{equation}}\n{body}\n\\end{{equation}}"
+            replacements.append((frame["start"], match.end(), replacement))
+
+        for start, end, replacement in reversed(replacements):
+            content = content[:start] + replacement + content[end:]
+        return content
 
     @classmethod
     def normalize_tree(cls, tree: Dict[str, Any]) -> Dict[str, Any]:
@@ -51,58 +77,94 @@ class HierarchyNormalizer:
         if "root" not in tree:
             raise ValueError("Hierarchy tree JSON is missing its 'root' field.")
 
-        normalized = copy.deepcopy(tree)
+        normalized = cls._copy_json_tree(tree)
         root = normalized["root"]
         if root is not None:
             cls._normalize_node(root, set())
         return normalized
 
+    @staticmethod
+    def _copy_json_tree(value: Any) -> Any:
+        """Copy JSON containers iteratively so deeply nested trees avoid recursion limits."""
+        if not isinstance(value, (dict, list)):
+            return value
+
+        root_copy = {} if isinstance(value, dict) else []
+        copies = {id(value): root_copy}
+        pending = [(value, root_copy)]
+        while pending:
+            source, target = pending.pop()
+            items = source.items() if isinstance(source, dict) else enumerate(source)
+            for key, child in items:
+                if isinstance(child, (dict, list)):
+                    child_copy = copies.get(id(child))
+                    if child_copy is None:
+                        child_copy = {} if isinstance(child, dict) else []
+                        copies[id(child)] = child_copy
+                        pending.append((child, child_copy))
+                    if isinstance(target, dict):
+                        target[key] = child_copy
+                    else:
+                        target.append(child_copy)
+                elif isinstance(target, dict):
+                    target[key] = child
+                else:
+                    target.append(child)
+        return root_copy
+
     @classmethod
     def _normalize_node(cls, node: Dict[str, Any], active_nodes: Set[int]) -> None:
-        if not isinstance(node, dict):
-            raise ValueError("Each hierarchy node must be a JSON object.")
+        pending = [(node, False)]
+        while pending:
+            current, exiting = pending.pop()
+            if not isinstance(current, dict):
+                raise ValueError("Each hierarchy node must be a JSON object.")
 
-        node_identity = id(node)
-        if node_identity in active_nodes:
-            raise ValueError("Hierarchy tree contains a cycle.")
+            node_identity = id(current)
+            if exiting:
+                active_nodes.remove(node_identity)
+                continue
+            if node_identity in active_nodes:
+                raise ValueError("Hierarchy tree contains a cycle.")
 
-        active_nodes.add(node_identity)
-        try:
-            content = node.get("content")
+            active_nodes.add(node_identity)
+            content = current.get("content")
             if content is not None:
                 if not isinstance(content, str):
                     raise ValueError("Hierarchy node 'content' must be a string.")
-                node["content"] = cls.normalize_content(
+                current["content"] = cls.normalize_content(
                     content,
-                    kind=node.get("kind"),
+                    kind=current.get("kind"),
                 )
 
-            children = node.get("children")
+            children = current.get("children")
             if children is not None:
                 if not isinstance(children, list):
                     raise ValueError("Hierarchy node 'children' must be a list.")
-                for child in children:
-                    cls._normalize_node(child, active_nodes)
-        finally:
-            active_nodes.remove(node_identity)
+                pending.append((current, True))
+                pending.extend((child, False) for child in reversed(children))
+            else:
+                active_nodes.remove(node_identity)
 
     @classmethod
     def normalize_file(cls, input_path: Path, output_path: Path) -> Path:
         """Normalize one tree file and write it to the destination, including in place."""
         input_path = Path(input_path)
         output_path = Path(output_path)
+        serialized = cls._normalized_file_content(input_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(serialized, encoding="utf-8")
+        return output_path
+
+    @classmethod
+    def _normalized_file_content(cls, input_path: Path) -> str:
         try:
             tree = json.loads(input_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"Unable to read hierarchy tree '{input_path}': {error}") from error
 
         normalized = cls.normalize_tree(tree)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(normalized, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        return output_path
+        return json.dumps(normalized, ensure_ascii=False, indent=2) + "\n"
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:
@@ -147,6 +209,8 @@ def normalize_path(
     else:
         if input_path.suffix.lower() != ".json":
             raise ValueError("Input file must have a .json extension.")
+        if input_path.stem.endswith(".normalized"):
+            raise ValueError(f"Input file is already normalized: {input_path}")
         tree_files = [input_path]
         output_root = (
             Path(output_dir).resolve()
@@ -155,6 +219,7 @@ def normalize_path(
         )
 
     output_paths: List[Path] = []
+    planned_outputs: List[tuple[Path, Path, str]] = []
     for tree_file in tree_files:
         if is_directory:
             relative_path = tree_file.relative_to(input_path)
@@ -167,9 +232,18 @@ def normalize_path(
             raise FileExistsError(
                 f"Output already exists: {output_path}. Pass --overwrite to replace it."
             )
-        output_paths.append(
-            HierarchyNormalizer.normalize_file(tree_file, output_path)
+        planned_outputs.append(
+            (
+                tree_file,
+                output_path,
+                HierarchyNormalizer._normalized_file_content(tree_file),
+            )
         )
+
+    for _, output_path, serialized in planned_outputs:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(serialized, encoding="utf-8")
+        output_paths.append(output_path)
 
     return output_paths
 

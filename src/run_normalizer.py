@@ -11,45 +11,12 @@ curr_dir = Path(__file__).resolve().parent
 if str(curr_dir) not in sys.path:
     sys.path.insert(0, str(curr_dir))
 
-from parser.hierarchy_normalizer import HierarchyNormalizer
+from parser.pipeline import ParsingPipeline
 
 
 def find_hierarchy_trees(source_dir: Path) -> List[Path]:
-    """Find one hierarchy tree per version, preferring the version-local copy."""
-    publication_dirs = sorted(
-        path
-        for path in source_dir.iterdir()
-        if path.is_dir() and not path.name.startswith(".") and path.name != "elements"
-    )
-    tree_files: List[Path] = []
-
-    for publication_dir in publication_dirs:
-        elements_dir = publication_dir / "elements"
-        version_dirs = sorted(
-            (
-                path
-                for path in publication_dir.iterdir()
-                if path.is_dir()
-                and path.name.startswith("v")
-                and path.name[1:].isdigit()
-            ),
-            key=lambda path: int(path.name[1:]),
-        )
-
-        if version_dirs:
-            for version_dir in version_dirs:
-                version_tree = version_dir / "hierarchy_tree.json"
-                elements_tree = elements_dir / f"hierarchy_tree_{version_dir.name}.json"
-                if version_tree.is_file():
-                    tree_files.append(version_tree)
-                elif elements_tree.is_file():
-                    tree_files.append(elements_tree)
-        elif elements_dir.is_dir():
-            tree_files.extend(
-                sorted(elements_dir.glob("hierarchy_tree_v*.json"))
-            )
-
-    return tree_files
+    """Compatibility wrapper for discovering generated per-version trees."""
+    return ParsingPipeline.find_hierarchy_trees(source_dir)
 
 
 def normalize_publications(source_dir: Path) -> List[Path]:
@@ -58,15 +25,11 @@ def normalize_publications(source_dir: Path) -> List[Path]:
     if not source_dir.is_dir():
         raise FileNotFoundError(f"Source directory does not exist: {source_dir}")
 
-    tree_files = find_hierarchy_trees(source_dir)
-    if not tree_files:
+    outputs = ParsingPipeline.normalize_source(source_dir)
+    if not outputs:
         raise FileNotFoundError(
             f"No per-version hierarchy tree files found under: {source_dir}"
         )
-
-    outputs: List[Path] = []
-    for tree_file in tree_files:
-        outputs.append(HierarchyNormalizer.normalize_file(tree_file, tree_file))
     return outputs
 
 

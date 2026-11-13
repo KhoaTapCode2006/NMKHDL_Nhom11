@@ -255,16 +255,23 @@ def get_source(
     filtered_uncompressed_bytes = 0
     raw_archive_bytes = len(archive_bytes) if archive_bytes else 0
     archive_error = None
+    source_is_pdf = False
 
     if download_succeeded and not archive_bytes:
         archive_error = "Source endpoint returned an empty response"
     elif download_succeeded and archive_bytes:
-        try:
-            archive = tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*")
-        except tarfile.ReadError:
+        source_is_pdf = archive_bytes.lstrip().startswith(b"%PDF-")
+        if source_is_pdf:
             archive = None
+        else:
+            try:
+                archive = tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*")
+            except tarfile.ReadError:
+                archive = None
 
-        if archive is not None:
+        if source_is_pdf:
+            pass
+        elif archive is not None:
             with archive:
                 for member in archive.getmembers():
                     if member.isfile():
@@ -313,6 +320,8 @@ def get_source(
     if tex_files or bib_files:
         metadata["source_status"] = "downloaded"
     elif source_not_found:
+        metadata["source_status"] = "no_tex_or_bib"
+    elif source_is_pdf:
         metadata["source_status"] = "no_tex_or_bib"
     elif download_error or archive_error or not download_succeeded:
         metadata["source_status"] = "download_failed"

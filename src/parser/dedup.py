@@ -23,8 +23,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .extractor import HierarchyExtractor
 from .hierarchy_builder import HierarchyBuilder
+from .hierarchy_normalizer import HierarchyNormalizer
 
 
 class ReferenceDeduplicator:
@@ -1127,10 +1127,9 @@ class ElementDeduplicator:
         trước khi so khớp full-text (tuân thủ quy định của Milestone 2:
         'full-text matching should be performed after cleanup').
         """
-        if not content or kind in ("document", "itemize"):
+        if not content or kind == "document":
             return content
-        text = HierarchyExtractor.standardize_math(content)
-        text = HierarchyExtractor.clean_latex(text)
+        text = HierarchyNormalizer.normalize_content(content, kind=kind)
         return cls.normalize_content_key(text)
 
     @classmethod
@@ -1396,11 +1395,31 @@ class PublicationDeduplicator:
             ],
             key=lambda x: int(x.name[1:]),
         )
-        if version_dirs:
-            version_names = [vd.name for vd in version_dirs]
-        else:
-            inlined_files = sorted(elements_dir.glob("full_inlined_v*.tex"))
-            version_names = [f.stem.replace("full_inlined_", "") for f in inlined_files]
+        manifest_path = elements_dir / "compilation_manifest.json"
+        manifest_data: Dict[str, Any] = {}
+        if manifest_path.is_file():
+            try:
+                loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_manifest, dict):
+                    manifest_data = loaded_manifest
+            except (OSError, json.JSONDecodeError):
+                manifest_data = {}
+
+        version_names_set = {vd.name for vd in version_dirs}
+        version_names_set.update(
+            path.stem.replace("full_inlined_", "")
+            for path in elements_dir.glob("full_inlined_v*.tex")
+        )
+        version_names_set.update(manifest_data)
+        version_names = sorted(
+            version_names_set,
+            key=lambda name: (
+                0,
+                int(name[1:]),
+            )
+            if name.startswith("v") and name[1:].isdigit()
+            else (1, name),
+        )
 
         version_parsed_data: Dict[str, Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
         empty_versions: Set[str] = set()
@@ -1410,6 +1429,12 @@ class PublicationDeduplicator:
         has_raw_refs = raw_refs_path.is_file()
 
         for v_name in version_names:
+            manifest_record = manifest_data.get(v_name)
+            version_status = (
+                manifest_record.get("status")
+                if isinstance(manifest_record, dict)
+                else None
+            )
             pre_elems_path = elements_dir / f"pre_dedup_elements_{v_name}.json"
             pre_hier_path = elements_dir / f"pre_dedup_hierarchy_{v_name}.json"
             elems_v_path = elements_dir / f"elements_{v_name}.json"
@@ -1430,7 +1455,7 @@ class PublicationDeduplicator:
                         raw_hier = json.loads(pre_hier_path.read_text(encoding="utf-8"))
                         if raw_elems:
                             version_parsed_data[v_name] = (raw_elems, raw_hier)
-                        else:
+                        elif version_status != "failed":
                             empty_versions.add(v_name)
                         continue
                 except Exception:
@@ -1458,15 +1483,18 @@ class PublicationDeduplicator:
                             version_parsed_data[v_name] = (raw_elems, raw_hier)
                             continue
                     else:
-                        empty_versions.add(v_name)
+                        if version_status != "failed":
+                            empty_versions.add(v_name)
                         continue
                 except Exception:
                     pass
             elif tree_v_path.is_file():
                 try:
                     t_obj = json.loads(tree_v_path.read_text(encoding="utf-8"))
-                    if t_obj.get("is_empty"):
+                    if t_obj.get("is_empty") or t_obj.get("status") == "empty_version":
                         empty_versions.add(v_name)
+                        continue
+                    if t_obj.get("status") == "failed":
                         continue
                 except Exception:
                     pass
@@ -1492,31 +1520,33 @@ class PublicationDeduplicator:
                     inlined_p.write_text(inlined_tex, encoding="utf-8")
 
             if not inlined_tex:
-                empty_versions.add(v_name)
+                if version_status != "failed":
+                    empty_versions.add(v_name)
                 err_msg = (
                     gather_res.get("error")
                     if gather_res
                     else "Version không có mã nguồn TeX (empty record)"
                 )
-                v_out = HierarchyBuilder.build_version_hierarchy_outputs(
-                    arxiv_id=arxiv_id,
-                    version_name=v_name,
-                    raw_elements=[],
-                    raw_hierarchy=[],
-                    is_empty=True,
-                    error_msg=err_msg,
-                )
-                if v_dir.is_dir():
-                    (v_dir / "hierarchy_tree.json").write_text(
+                if version_status != "failed":
+                    v_out = HierarchyBuilder.build_version_hierarchy_outputs(
+                        arxiv_id=arxiv_id,
+                        version_name=v_name,
+                        raw_elements=[],
+                        raw_hierarchy=[],
+                        is_empty=True,
+                        error_msg=err_msg,
+                    )
+                    if v_dir.is_dir():
+                        (v_dir / "hierarchy_tree.json").write_text(
+                            json.dumps(v_out["tree"], ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                    (elements_dir / f"hierarchy_tree_{v_name}.json").write_text(
                         json.dumps(v_out["tree"], ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
-                (elements_dir / f"hierarchy_tree_{v_name}.json").write_text(
-                    json.dumps(v_out["tree"], ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
                 preserved_references_by_version[v_name] = {
-                    "status": "empty_version",
+                    "status": version_status or "empty_version",
                     "thebibliography_blocks": [],
                     "bibitem_entries": [],
                     "bibliography_commands": [],
@@ -1569,6 +1599,19 @@ class PublicationDeduplicator:
 
         # Bước 1: Đọc dữ liệu từng version
         version_names, version_parsed_data, empty_versions = cls.load_or_build_version_data(pub_dir)
+        manifest_path = pub_dir / "elements" / "compilation_manifest.json"
+        try:
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest_data, dict):
+                manifest_data = {}
+        except (OSError, json.JSONDecodeError):
+            manifest_data = {}
+        failed_versions = sum(
+            1
+            for version_name in version_names
+            if isinstance(manifest_data.get(version_name), dict)
+            and manifest_data[version_name].get("status") == "failed"
+        )
 
         # Bước 2: Đọc và khử trùng lặp Reference Entries (BibTeX)
         raw_bib_entries = ReferenceDeduplicator.load_publication_references(pub_dir, version_names)
@@ -1677,6 +1720,7 @@ class PublicationDeduplicator:
             "total_versions": len(version_names),
             "tex_versions": len(version_parsed_data),
             "empty_versions": len(empty_versions),
+            "failed_versions": failed_versions,
             "elements_dedup": elem_dedup_res["stats"],
             "bibtex_dedup": bib_dedup_res["stats"],
             "merged_bibtex_details": bib_dedup_res["merged_details"],
@@ -1692,6 +1736,7 @@ class PublicationDeduplicator:
             "total_versions": len(version_names),
             "tex_versions": len(version_parsed_data),
             "empty_versions": len(empty_versions),
+            "failed_versions": failed_versions,
             "elements_count": len(elem_dedup_res["elements"]),
             "hierarchy_count": len(elem_dedup_res["hierarchy"]),
             "bibtex_count": len(bib_dedup_res["bibtex"]),

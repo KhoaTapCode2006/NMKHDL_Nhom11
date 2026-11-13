@@ -11,7 +11,6 @@ Script thực thi nhiệm vụ Khử Trùng Lặp (Deduplication - Phần của 
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
@@ -21,7 +20,7 @@ curr_dir = Path(__file__).resolve().parent
 if str(curr_dir) not in sys.path:
     sys.path.insert(0, str(curr_dir))
 
-from parser.dedup import PublicationDeduplicator
+from parser.pipeline import ParsingPipeline
 
 
 def resolve_default_source_dir() -> Path:
@@ -37,47 +36,41 @@ def resolve_default_source_dir() -> Path:
     return candidates[0]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Milestone 2 — Chạy khử trùng lặp Reference Entries & Full-text Content (Phần của Kiệt)"
+        description="Milestone 2 reference and full-text deduplication runner."
     )
     parser.add_argument(
         "--source-dir",
         type=str,
         default=str(resolve_default_source_dir()),
-        help="Đường dẫn tới thư mục chứa các bài báo (mặc định: ./sourcesArxiv)",
+        help="Directory containing publication folders.",
     )
     parser.add_argument(
         "--summary-json",
         type=str,
         default=str(curr_dir / "dedup_summary_stats.json"),
-        help="Đường dẫn lưu file thống kê tổng hợp Deduplication (mặc định: src/dedup_summary_stats.json)",
+        help="Path for the deduplication summary JSON file.",
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Giới hạn số lượng bài báo cần xử lý (tùy chọn)",
+        help="Optional maximum number of publications to process.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv=None) -> None:
+    args = parse_args(argv)
     source_path = Path(args.source_dir).resolve()
 
     if not source_path.is_dir():
         print(f"Lỗi: Thư mục nguồn không tồn tại: {source_path}")
         sys.exit(1)
 
-    pub_dirs = sorted(
-        [
-            d
-            for d in source_path.iterdir()
-            if d.is_dir() and not d.name.startswith(".") and d.name not in ("elements", "bibtex")
-        ]
-    )
-    if args.limit:
+    pub_dirs = ParsingPipeline.find_publications(source_path)
+    if args.limit is not None:
         pub_dirs = pub_dirs[: args.limit]
 
     print("=" * 78)
@@ -100,7 +93,7 @@ def main() -> None:
     by_kind_after_global: Dict[str, int] = {}
 
     for idx, p_dir in enumerate(pub_dirs, 1):
-        res = PublicationDeduplicator.deduplicate_and_save_publication(
+        res = ParsingPipeline.deduplicate_publication(
             pub_dir=p_dir,
             clean_before_match=True,
         )
@@ -142,38 +135,6 @@ def main() -> None:
         else 0.0
     )
 
-    summary_payload = {
-        "execution_time_sec": round(elapsed, 2),
-        "total_publications": len(pub_dirs),
-        "multi_version_publications": sum(1 for r in pub_results if r["total_versions"] > 1),
-        "total_versions": sum(r["total_versions"] for r in pub_results),
-        "tex_versions": sum(r["tex_versions"] for r in pub_results),
-        "empty_versions": sum(r["empty_versions"] for r in pub_results),
-        "fulltext_deduplication": {
-            "total_elements_before": total_elems_before,
-            "total_elements_after": total_elems_after,
-            "removed_duplicates": elems_removed,
-            "reduction_percentage": elems_red_pct,
-            "by_kind_before": by_kind_before_global,
-            "by_kind_after": by_kind_after_global,
-        },
-        "reference_deduplication": {
-            "total_entries_before": total_bib_before,
-            "total_entries_after": total_bib_after,
-            "removed_duplicates": bib_removed,
-            "reduction_percentage": bib_red_pct,
-            "renamed_citation_keys": total_renamed_keys,
-            "cite_commands_updated_in_text": total_cite_cmds_updated,
-            "entries_enriched_by_field_union": total_enriched_entries,
-        },
-        "publications": pub_results,
-    }
-
-    summary_path = Path(args.summary_json).resolve()
-    summary_path.write_text(
-        json.dumps(summary_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
 
     print("=" * 78)
     print(f"  Hoàn thành khử trùng lặp {len(pub_dirs)} bài báo trong {elapsed:.2f}s")
@@ -190,7 +151,6 @@ def main() -> None:
         f"Cập nhật {total_cite_cmds_updated} lệnh \\cite{{}} | "
         f"Hợp nhất bổ sung trường cho {total_enriched_entries} entries"
     )
-    print(f"  Đã lưu thống kê tổng hợp tại: {summary_path}")
     print("=" * 78)
 
 

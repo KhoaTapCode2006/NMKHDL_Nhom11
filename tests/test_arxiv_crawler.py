@@ -225,6 +225,40 @@ class ArxivCrawlerTests(unittest.TestCase):
         self.assertEqual(result["source_status"], "download_failed")
         self.assertIn("Invalid source archive", result["error"])
 
+    @patch.object(arxiv_crawler.time, "sleep")
+    @patch.object(arxiv_crawler.urllib.request, "urlopen")
+    def test_get_source_caches_direct_pdf_as_version_without_tex_or_bib(
+        self, urlopen, _sleep
+    ):
+        urlopen.return_value.__enter__.return_value.read.return_value = (
+            b"%PDF-1.7\nbinary PDF response"
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = arxiv_crawler.get_source(
+                "2501.12345v1",
+                save_dir=temp_dir,
+                paper=self.paper,
+            )
+            version_dir = Path(result["version_dir"])
+            metadata = json.loads(
+                (version_dir / "metadata.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(result["source_status"], "no_tex_or_bib")
+            self.assertEqual(metadata["source_status"], "no_tex_or_bib")
+            self.assertEqual(result["tex_files"], [])
+            self.assertEqual(result["bib_files"], [])
+
+            skipped = arxiv_crawler.get_source(
+                "2501.12345v1",
+                save_dir=temp_dir,
+                paper=self.paper,
+            )
+
+        self.assertEqual(skipped["source_status"], "skipped")
+        urlopen.assert_called_once()
+
     def test_get_source_resume_skips_previously_completed_version(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             version_dir = Path(temp_dir) / "2501.12345" / "v1"
