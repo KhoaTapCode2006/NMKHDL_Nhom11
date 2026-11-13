@@ -100,15 +100,15 @@ python src/verify_output.py
 ### Bước 3: Chạy lại toàn bộ Parser Pipeline (Nếu muốn)
 - **Lựa chọn 1: Chạy và giữ nguyên file `.tex` gốc (không xóa)**:
   ```powershell
-  python src/run_parser.py --no-clean-tex
+  python -m src.parser.pipeline --no-clean-tex
   ```
 - **Lựa chọn 2: Chạy và xóa các file `.tex` thừa/nháp** (theo đúng yêu cầu dọn dẹp của đề Milestone 2):
   ```powershell
-  python src/run_parser.py --clean-tex
+  python -m src.parser.pipeline
   ```
 - **Lựa chọn 3: Chạy thử trên 5 bài đầu tiên để kiểm tra nhanh**:
   ```powershell
-  python src/run_parser.py --limit 5 --no-clean-tex
+  python -m src.parser.pipeline --limit 5 --no-clean-tex
   ```
 
 ---

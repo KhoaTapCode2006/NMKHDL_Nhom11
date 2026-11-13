@@ -33,3 +33,28 @@ The project uses two complementary approaches: the arXiv crawler and the OAI-bas
 | Output | Paper metadata, version folders, references | Structured metadata records, identifiers, harvesting state |
 
 This table is a practical sample comparison. In practice, both crawler types can be used together to achieve precise control over a target set and broader repository visibility.
+
+## 7. Run the parsing pipeline
+
+Run the end-to-end pipeline against the publication folders. It gathers the
+compilation path, builds and normalizes per-version hierarchies, extracts and
+deduplicates references, rewrites citations, deduplicates elements across
+versions, and writes the outputs under each publication's `elements/` and
+`bibtex/` folders. Use `--no-clean-tex` to retain the original sources:
+
+```powershell
+python -m src.parser.pipeline --source-dir src\sourcesArxiv
+```
+
+The other runner scripts are not needed for a normal end-to-end run.
+`run_parser.py` and `run_hierarchy.py` remain compatibility entry points for the
+same workflow. The normalizer and deduplication scripts are optional if you
+need to rerun only those stages on existing generated data:
+
+```powershell
+python src\run_normalizer.py --source-dir src\sourcesArxiv
+python src\run_dedup.py --source-dir src\sourcesArxiv
+```
+
+`run_normalizer.py` normalizes existing version trees in place, while
+`run_dedup.py` updates the unified element, hierarchy, and BibTeX outputs.

@@ -1,0 +1,53 @@
+{
+  "performance": {
+    "total_wall_time_sec": 13.48,
+    "avg_time_per_pub_sec": 0.674,
+    "avg_time_per_version_sec": 0.449,
+    "peak_rss_mb": 102.52,
+    "peak_tracemalloc_mb": 36.13
+  },
+  "success_rate": {
+    "total_publications": 20,
+    "total_versions_processed": 30,
+    "successful_versions": 23,
+    "empty_versions": 3,
+    "failed_versions": 4,
+    "success_rate_percentage": 76.67
+  },
+  "version_coverage": {
+    "total_expected_versions": 30,
+    "versions_with_tex": 23,
+    "empty_versions": 3,
+    "coverage_percentage": 76.67
+  },
+  "deduplication": {
+    "total_elements_before": 7168,
+    "total_elements_after": 5934,
+    "reduction_count": 1234,
+    "reduction_percentage": 17.22,
+    "by_kind_before": {
+      "document": 23,
+      "section": 182,
+      "sentence": 5715,
+      "block_formula": 437,
+      "figure": 187,
+      "itemize": 59,
+      "item": 202,
+      "paragraph": 41,
+      "subsection": 248,
+      "subsubsection": 74
+    },
+    "by_kind_after": {
+      "document": 23,
+      "section": 131,
+      "sentence": 4800,
+      "block_formula": 337,
+      "figure": 168,
+      "itemize": 53,
+      "item": 178,
+      "paragraph": 26,
+      "subsection": 147,
+      "subsubsection": 71
+    }
+  }
+}

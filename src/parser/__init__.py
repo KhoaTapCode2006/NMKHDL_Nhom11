@@ -8,7 +8,6 @@ from .extractor import HierarchyExtractor
 from .hierarchy_builder import HierarchyBuilder
 from .dedup import ElementDeduplicator
 from .benchmark import ParserBenchmark
-from .pipeline import ParsingPipeline
 
 __all__ = [
     "MultiFileGatherer",
@@ -18,3 +17,11 @@ __all__ = [
     "ParserBenchmark",
     "ParsingPipeline",
 ]
+
+
+def __getattr__(name: str):
+    if name == "ParsingPipeline":
+        from .pipeline import ParsingPipeline
+
+        return ParsingPipeline
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
