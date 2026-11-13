@@ -10,6 +10,8 @@ import re
 import uuid
 from typing import Dict, List, Optional, Tuple, Any
 
+from .hierarchy_normalizer import HierarchyNormalizer
+
 
 class HierarchyExtractor:
     """Extracts hierarchical elements from LaTeX text and standardizes content."""
@@ -24,29 +26,7 @@ class HierarchyExtractor:
     }
 
     # Commands that should be removed during text cleanup
-    CLEANUP_COMMANDS = [
-        r"\\centering\b",
-        r"\\raggedright\b",
-        r"\\raggedleft\b",
-        r"\\small\b",
-        r"\\footnotesize\b",
-        r"\\large\b",
-        r"\\Large\b",
-        r"\\normalsize\b",
-        r"\\midrule\b",
-        r"\\toprule\b",
-        r"\\bottomrule\b",
-        r"\\hline\b",
-        r"\\clearpage\b",
-        r"\\newpage\b",
-        r"\\noindent\b",
-        r"\\label\{[^}]*\}",
-        r"\\vspace\*?\{[^}]*\}",
-        r"\\hspace\*?\{[^}]*\}",
-        r"\\smallskip\b",
-        r"\\medskip\b",
-        r"\\bigskip\b",
-    ]
+    CLEANUP_COMMANDS = HierarchyNormalizer.CLEANUP_COMMANDS
 
     ABBREVIATIONS = [
         r"\be\.g\.",
@@ -82,47 +62,13 @@ class HierarchyExtractor:
 
     @classmethod
     def standardize_math(cls, text: str) -> str:
-        """
-        Standardizes inline math to $...$ and block math to \\begin{equation}...\\end{equation}.
-        """
-        # Convert inline \( ... \) to $ ... $
-        text = re.sub(r"\\\((.*?)\\\)", r"$\1$", text, flags=re.DOTALL)
-
-        # Convert $$ ... $$ to \begin{equation} ... \end{equation}
-        text = re.sub(
-            r"\$\$(.*?)\$\$",
-            lambda m: f"\\begin{{equation}}\n{m.group(1).strip()}\n\\end{{equation}}",
-            text,
-            flags=re.DOTALL,
-        )
-
-        # Convert \[ ... \] to \begin{equation} ... \end{equation}
-        text = re.sub(
-            r"\\\[(.*?)\\\]",
-            lambda m: f"\\begin{{equation}}\n{m.group(1).strip()}\n\\end{{equation}}",
-            text,
-            flags=re.DOTALL,
-        )
-
-        return text
+        """Compatibility delegate; normalization rules live in HierarchyNormalizer."""
+        return HierarchyNormalizer.standardize_math(text)
 
     @classmethod
     def clean_latex(cls, text: str) -> str:
-        """Removes formatting-only macros and non-semantic LaTeX commands."""
-        # Strip comments
-        text = re.sub(r"(?<!\\)(?:\\\\)*%.*$", "", text, flags=re.MULTILINE)
-
-        # Remove cleanup commands
-        for cmd in cls.CLEANUP_COMMANDS:
-            text = re.sub(cmd, "", text)
-
-        # Remove optional placement arguments like [htpb], [t!], [!htb]
-        text = re.sub(r"\\begin\{(?:figure|table)\*?\}\s*\[[^\]]*\]", lambda m: m.group(0).split("[")[0], text)
-
-        # Normalize whitespace (replace multiple newlines and spaces)
-        text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n\s*\n+", "\n\n", text)
-        return text.strip()
+        """Compatibility delegate; cleanup rules live in HierarchyNormalizer."""
+        return HierarchyNormalizer.clean_latex(text)
 
     @classmethod
     def strip_references_section(cls, text: str) -> str:

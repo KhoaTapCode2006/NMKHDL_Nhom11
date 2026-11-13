@@ -8,12 +8,33 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from .extractor import HierarchyExtractor
-
 
 class HierarchyNormalizer:
     """Normalize node content while preserving the tree structure and IDs."""
 
+    CLEANUP_COMMANDS = [
+        r"\\centering\b",
+        r"\\raggedright\b",
+        r"\\raggedleft\b",
+        r"\\small\b",
+        r"\\footnotesize\b",
+        r"\\large\b",
+        r"\\Large\b",
+        r"\\normalsize\b",
+        r"\\midrule\b",
+        r"\\toprule\b",
+        r"\\bottomrule\b",
+        r"\\hline\b",
+        r"\\clearpage\b",
+        r"\\newpage\b",
+        r"\\noindent\b",
+        r"\\label\{[^}]*\}",
+        r"\\vspace\*?\{[^}]*\}",
+        r"\\hspace\*?\{[^}]*\}",
+        r"\\smallskip\b",
+        r"\\medskip\b",
+        r"\\bigskip\b",
+    ]
     BLOCK_MATH_ENVIRONMENTS = (
         "equation\\*?|align\\*?|gather\\*?|multline\\*?|"
         "eqnarray\\*?|flalign\\*?|displaymath"
@@ -24,14 +45,52 @@ class HierarchyNormalizer:
     )
 
     @classmethod
+    def standardize_math(cls, text: str) -> str:
+        """Normalize inline and display math delimiters for comparison."""
+        text = re.sub(r"\\\((.*?)\\\)", r"$\1$", text, flags=re.DOTALL)
+        text = re.sub(
+            r"\$\$(.*?)\$\$",
+            lambda match: (
+                f"\\begin{{equation}}\n{match.group(1).strip()}\n"
+                "\\end{equation}"
+            ),
+            text,
+            flags=re.DOTALL,
+        )
+        return re.sub(
+            r"\\\[(.*?)\\\]",
+            lambda match: (
+                f"\\begin{{equation}}\n{match.group(1).strip()}\n"
+                "\\end{equation}"
+            ),
+            text,
+            flags=re.DOTALL,
+        )
+
+    @classmethod
+    def clean_latex(cls, text: str) -> str:
+        """Remove formatting-only commands and normalize whitespace."""
+        text = re.sub(r"(?<!\\)(?:\\\\)*%.*$", "", text, flags=re.MULTILINE)
+        for command in cls.CLEANUP_COMMANDS:
+            text = re.sub(command, "", text)
+        text = re.sub(
+            r"\\begin\{(?:figure|table)\*?\}\s*\[[^\]]*\]",
+            lambda match: match.group(0).split("[")[0],
+            text,
+        )
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n\s*\n+", "\n\n", text)
+        return text.strip()
+
+    @classmethod
     def normalize_content(cls, content: str, kind: Optional[str] = None) -> str:
         """Remove non-semantic LaTeX and normalize inline/display math delimiters."""
-        normalized = HierarchyExtractor.standardize_math(content)
+        normalized = cls.standardize_math(content)
 
         if kind == "block_formula":
             normalized = cls._normalize_block_math_environments(normalized)
 
-        return HierarchyExtractor.clean_latex(normalized)
+        return cls.clean_latex(normalized)
 
     @classmethod
     def _normalize_block_math_environments(cls, content: str) -> str:
