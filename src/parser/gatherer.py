@@ -2,20 +2,20 @@
 Multi-file gathering for LaTeX publications.
 Identifies root TeX file, recursively resolves \\input and \\include,
 honors \\includeonly, avoids cycle misdetection via call stack tracking,
-builds compilation path, and manages redundant file cleanup.
+and returns the in-memory compilation path. Publication artifacts are persisted
+by ParsingPipeline, not by this module.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import json
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Set, Tuple
 
 
 class MultiFileGatherer:
-    """Discovers root TeX documents and recursively inlines included files."""
+    """Discover roots and inline includes without writing pipeline artifacts."""
 
     # Matches LaTeX comments (% not preceded by an odd number of backslashes)
     COMMENT_PATTERN = re.compile(r"(?<!\\)(?:\\\\)*%.*$", re.MULTILINE)
@@ -231,9 +231,10 @@ class MultiFileGatherer:
         metadata: Optional[dict] = None,
     ) -> dict:
         """
-        Performs full multi-file gathering for a single version directory.
+        Perform in-memory multi-file gathering for one version directory.
         Properly honors compilation path, \\includeonly, call-stack cycle detection,
-        and accurately reports whether gathering was fully complete or failed.
+        and report whether gathering was fully complete or failed. Writing the
+        inlined TeX and compilation manifest is the pipeline's responsibility.
         """
         version_dir = Path(version_dir).resolve()
         all_tex_files = sorted(list(version_dir.glob("**/*.tex")))

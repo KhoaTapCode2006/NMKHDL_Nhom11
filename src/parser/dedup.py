@@ -46,7 +46,7 @@ class ReferenceDeduplicator:
         "proceedings": 6,
         "techreport": 5,
         "manual": 4,
-        " booklet": 4,
+        "booklet": 4,
         "unpublished": 3,
         "online": 2,
         "misc": 1,
@@ -156,14 +156,17 @@ class ReferenceDeduplicator:
         if not auth_str:
             return []
 
-        # Tách theo từ khóa ' and ' chuẩn của BibTeX trước
-        if re.search(r"\band\b", auth_str, flags=re.IGNORECASE):
-            parts = re.split(r"\s+\band\b\s+", auth_str, flags=re.IGNORECASE)
-        elif ";" in auth_str:
-            parts = auth_str.split(";")
-        else:
-            # Nếu định dạng từ \bibitem như "A. Vaswani, N. Shazeer, ..."
-            parts = [auth_str]
+        # BibTeX's "Last, First" names use commas internally, so only split
+        # comma-separated names when the next author is written as initials.
+        author_groups = re.split(r"\s+\band\b\s+|;", auth_str, flags=re.IGNORECASE)
+        parts = [
+            author
+            for group in author_groups
+            for author in re.split(
+                r",\s*(?=(?:[A-Z]\.\s*)+[A-Z][\w'’\-]*)",
+                group,
+            )
+        ]
 
         cleaned_list: List[str] = []
         for p in parts:
@@ -455,7 +458,14 @@ class ReferenceDeduplicator:
                     if len(parts) >= 2:
                         authors_raw = parts[0]
                         title = parts[1]
-                        journal = ". ".join(parts[2:])
+                        journal_parts = parts[2:]
+                        if (
+                            journal_parts
+                            and year is not None
+                            and cls.parse_year_int(journal_parts[-1]) == year
+                        ):
+                            journal_parts.pop()
+                        journal = ". ".join(journal_parts)
                     elif len(parts) == 1:
                         title = parts[0]
 

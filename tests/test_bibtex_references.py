@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from src.parser.dedup import ReferenceDeduplicator
 from src.parser.hierarchy_builder import HierarchyBuilder
 from src.run_hierarchy import process_publication_hierarchy
 
@@ -87,6 +88,51 @@ def assert_valid_bibtex(test_case, text):
 
 
 class BibtexReferenceTests(unittest.TestCase):
+    def test_comma_separated_bibitem_authors_match_bibtex_without_doi(self):
+        bibtex_entries = ReferenceDeduplicator.parse_bib_content(
+            "@article{vaswani2017, "
+            "title={Attention Is All You Need}, "
+            "author={Vaswani, A. and Shazeer, N.}, "
+            "year={2017}}",
+            "2301.01234",
+            "v1",
+        )
+        bibitem_entries = ReferenceDeduplicator.parse_bibitem_entries(
+            [
+                r"\bibitem{transformer} A. Vaswani, N. Shazeer. "
+                "Attention Is All You Need. 2017."
+            ],
+            "2301.01234",
+            "v1",
+        )
+
+        self.assertEqual(
+            bibitem_entries[0]["authors"],
+            ["A. Vaswani", "N. Shazeer"],
+        )
+        self.assertEqual(bibitem_entries[0]["journal"], "")
+        result = ReferenceDeduplicator.deduplicate_bibtex(
+            "2301.01234",
+            bibtex_entries + bibitem_entries,
+        )
+        self.assertEqual(len(result["bibtex"]), 1)
+        self.assertEqual(
+            result["key_mapping"]["transformer"],
+            "vaswani2017",
+        )
+
+    def test_booklet_entry_type_has_expected_priority(self):
+        result = ReferenceDeduplicator.unionize_cluster(
+            "2301.01234",
+            [
+                {"entry_type": "misc"},
+                {"entry_type": "booklet"},
+            ],
+            "booklet_key",
+        )
+
+        self.assertEqual(result["entry_type"], "booklet")
+
     def test_extracts_complete_reference_metadata_and_serializes_valid_bibtex(self):
         reference = {
             "citation_key": "doe2022",

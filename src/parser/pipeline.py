@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class ParsingPipeline:
-    """Runs gather, hierarchy construction, normalization, and dedup in order."""
+    """Orchestrate gathering, artifact persistence, hierarchy, normalization, and dedup."""
 
     def __init__(
         self,
@@ -113,12 +113,13 @@ class ParsingPipeline:
         inlined_path: Optional[Path] = None,
         previous_manifest: Optional[dict] = None,
     ) -> Dict[str, Any]:
-        """Gather and parse one version, retaining the gather result for output."""
+        """Gather and parse one version, retaining the result for pipeline persistence."""
         start_time = time.perf_counter()
         gather_res = MultiFileGatherer.gather(version_dir, metadata=metadata)
         has_source_tex = version_dir.is_dir() and any(
             version_dir.rglob("*.tex")
         )
+        reused_inlined_content = False
 
         # A previous successful run may already have removed the source .tex files.
         if (
@@ -134,6 +135,7 @@ class ParsingPipeline:
             if was_successful:
                 inlined_content = inlined_path.read_text(encoding="utf-8")
                 if inlined_content.strip():
+                    reused_inlined_content = True
                     root_name = (
                         previous_manifest.get("root_file")
                         if previous_manifest
@@ -175,6 +177,7 @@ class ParsingPipeline:
                 "elements": [],
                 "hierarchy": [],
                 "preserved_references": {},
+                "reused_inlined_content": False,
             }
 
         try:
@@ -201,6 +204,7 @@ class ParsingPipeline:
                 "elements": [],
                 "hierarchy": [],
                 "preserved_references": {},
+                "reused_inlined_content": False,
             }
 
         self.benchmark.record_version(
@@ -219,10 +223,15 @@ class ParsingPipeline:
             "elements": elements,
             "hierarchy": hierarchy,
             "preserved_references": preserved_references,
+            "reused_inlined_content": reused_inlined_content,
         }
 
     def build_publication(self, pub_dir: Path) -> Dict[str, Any]:
-        """Gather and build all version trees and raw inputs required by dedup."""
+        """Gather sources, persist inline TeX/manifests, and build pre-dedup trees.
+
+        MultiFileGatherer only returns in-memory results. This method owns the
+        publication-level files consumed by the later normalization and dedup stages.
+        """
         pub_dir = Path(pub_dir).resolve()
         if not pub_dir.is_dir():
             raise FileNotFoundError(f"Publication directory does not exist: {pub_dir}")
@@ -315,16 +324,28 @@ class ParsingPipeline:
                     "status": "success",
                     "is_empty": False,
                     "root_file": (
-                        gather_res["root_file"].name
-                        if gather_res["root_file"]
-                        else None
+                        (
+                            old_record.get("root_file")
+                            if old_record
+                            else None
+                        )
+                        if result["reused_inlined_content"]
+                        else (
+                            gather_res["root_file"].name
+                            if gather_res["root_file"]
+                            else None
+                        )
                     ),
-                    "compilation_files": [
-                        path.name for path in gather_res["compilation_files"]
-                    ],
-                    "orphan_files": [
-                        path.name for path in gather_res["orphan_files"]
-                    ],
+                    "compilation_files": (
+                        old_record.get("compilation_files", []) if old_record else []
+                    )
+                    if result["reused_inlined_content"]
+                    else [path.name for path in gather_res["compilation_files"]],
+                    "orphan_files": (
+                        old_record.get("orphan_files", []) if old_record else []
+                    )
+                    if result["reused_inlined_content"]
+                    else [path.name for path in gather_res["orphan_files"]],
                 }
                 raw_references_by_version[version_name] = {
                     "status": "success",

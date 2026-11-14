@@ -181,7 +181,17 @@ class RunParserTests(unittest.TestCase):
             pipeline = ParsingPipeline(source_dir=source_dir)
 
             first = pipeline.process_publication(publication)
+            first_manifest = json.loads(
+                (publication / "elements" / "compilation_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
             second = pipeline.process_publication(publication)
+            second_manifest = json.loads(
+                (publication / "elements" / "compilation_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
             elements = json.loads(
                 (publication / "elements" / "elements.json").read_text(
                     encoding="utf-8"
@@ -191,6 +201,11 @@ class RunParserTests(unittest.TestCase):
             self.assertFalse((version_dir / "main.tex").exists())
             self.assertEqual(first["tex_versions"], 1)
             self.assertEqual(second["tex_versions"], 1)
+            self.assertEqual(
+                second_manifest["v1"]["compilation_files"],
+                first_manifest["v1"]["compilation_files"],
+            )
+            self.assertEqual(second_manifest["v1"]["root_file"], "main.tex")
             self.assertIn(
                 "Persistent sentence.",
                 {element["content"] for element in elements},
