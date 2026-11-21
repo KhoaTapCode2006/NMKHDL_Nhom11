@@ -560,7 +560,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=project_root / "data" / "cleaned",
+        default=project_root / "src" / "data" / "cleaned",
     )
     parser.add_argument("--format", choices=("csv", "parquet"), default="csv")
     parser.add_argument(
