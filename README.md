@@ -58,3 +58,27 @@ python src\run_dedup.py --source-dir src\sourcesArxiv
 
 `run_normalizer.py` normalizes existing version trees in place, while
 `run_dedup.py` updates the unified element, hierarchy, and BibTeX outputs.
+
+## 8. Clean Milestone 1 and Milestone 2 tables
+
+The Phase 1 cleaning CLI normalizes BibTeX/reference schemas, titles, authors,
+years, and arXiv IDs while preserving the original columns:
+
+```powershell
+python -m src.model.data_cleaning
+```
+
+If the inputs are not under `data/bibtex`, `data/references`, or the crawler
+source folders, pass them explicitly:
+
+```powershell
+python -m src.model.data_cleaning `
+  --bibtex "path\to\bibtex.csv" `
+  --references "path\to\references.json" `
+  --references-source-dir "src\sourcesArxiv" `
+  --output-dir "data\cleaned" `
+  --format csv
+```
+
+Use `--format parquet` when a Parquet engine is installed. The command prints
+the discovered schemas, sample rows, null rates, and before/after row counts.
