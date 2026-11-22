@@ -416,14 +416,7 @@ def crawl_custom_range(
                         clean_redundant_tex=False,
                     )
                     try:
-                        build_info = pipeline.build_publication(paper_dir)
-                        for v_name in build_info.get("versions", []):
-                            v_tree = paper_dir / v_name / "hierarchy_tree.json"
-                            e_tree = paper_dir / "elements" / f"hierarchy_tree_{v_name}.json"
-                            for t_path in (v_tree, e_tree):
-                                if t_path.is_file():
-                                    pipeline.normalize_tree_file(t_path)
-                        pipeline.deduplicate_publication(paper_dir)
+                        pipeline.process_publication(paper_dir)
                     except Exception as exc:
                         print(f"  [parse] Warning on {base_id}: {exc}")
 
@@ -965,9 +958,6 @@ def prepare_manual_review(
                 groundtruth_id = ""
                 suggested_id = ref1_id if score1 >= 0.30 else ""
 
-        if (paper_id, citation_key) in VERIFIED_MANUAL_OVERRIDES:
-            groundtruth_id = VERIFIED_MANUAL_OVERRIDES[(paper_id, citation_key)]
-
         status_counts[review_status] = status_counts.get(review_status, 0) + 1
 
         def _fmt_authors(val: object) -> str:
@@ -1017,6 +1007,11 @@ def prepare_manual_review(
             for secondary in dup_rows[1:]:
                 secondary["groundtruth_arxiv_id"] = ""
                 secondary["review_status"] = "NEEDS_HUMAN_CHECK"
+
+    for row in review_rows:
+        key = (row["arxiv_id"], row["citation_key"])
+        if key in VERIFIED_MANUAL_OVERRIDES:
+            row["groundtruth_arxiv_id"] = VERIFIED_MANUAL_OVERRIDES[key]
 
     review_df = pd.DataFrame(review_rows)
     sheet_path = output_dir / "manual_review_sheet.csv"
