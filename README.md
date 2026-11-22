@@ -82,3 +82,30 @@ python -m src.model.data_cleaning `
 
 Use `--format parquet` when a Parquet engine is installed. The command prints
 the discovered schemas, sample rows, null rates, and before/after row counts.
+
+## 9. Manual labeling (Milestone 3)
+
+Build and validate the 20-publication manual ground-truth pool (5 publications
+from each of the 4 assigned ID ranges):
+
+```powershell
+python -m src.model.manual_labeling crawl-team20 --out sourcesManual20
+python -m src.model.manual_labeling prepare --source-dir sourcesManual20 --output-dir data/manual_labeling
+python -m src.model.manual_labeling finalize `
+  --review-csv data/manual_labeling/manual_review_sheet.csv `
+  --references-csv data/manual_labeling/references_cleaned.csv `
+  --output-dir data/manual_labeling `
+  --min-publications 20 `
+  --min-entries-per-pub 20 `
+  --min-total-entries 400
+```
+
+Internal ground-truth label schema produced under `data/manual_labeling/`:
+- `manual_labels.csv` / `manual_labels.json`: one row per labeled BibTeX entry
+  with columns `arxiv_id`, `citation_key`, `groundtruth_arxiv_id` (matched
+  `ref_arxiv_id` or `null` when unmatched), `is_positive` (`1` or `0`), and
+  `label_source` (`"manual"`).
+- `manual_candidate_pairs.csv`: full within-publication $m \times n$ binary
+  candidate matrix with columns `arxiv_id`, `citation_key`, `ref_arxiv_id`,
+  `label` (`1` or `0`), and `label_source` (`"manual"`).
+
