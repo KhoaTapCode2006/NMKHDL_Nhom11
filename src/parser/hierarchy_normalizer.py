@@ -16,25 +16,58 @@ class HierarchyNormalizer:
         r"\\centering\b",
         r"\\raggedright\b",
         r"\\raggedleft\b",
-        r"\\small\b",
+        r"\\tiny\b",
+        r"\\scriptsize\b",
         r"\\footnotesize\b",
+        r"\\small\b",
+        r"\\normalsize\b",
         r"\\large\b",
         r"\\Large\b",
-        r"\\normalsize\b",
+        r"\\LARGE\b",
+        r"\\huge\b",
+        r"\\Huge\b",
         r"\\midrule\b",
         r"\\toprule\b",
         r"\\bottomrule\b",
         r"\\hline\b",
+        r"\\cmidrule(?:\([^)]*\))?\{[^}]*\}",
+        r"\\cline\{[^}]*\}",
+        r"\\addlinespace(?:\[[^\]]*\])?",
         r"\\clearpage\b",
         r"\\newpage\b",
+        r"\\pagebreak\b",
+        r"\\linebreak\b",
+        r"\\allowbreak\b",
         r"\\noindent\b",
+        r"\\FloatBarrier\b",
+        r"\\vfill\b",
+        r"\\hfill\b",
         r"\\label\{[^}]*\}",
         r"\\vspace\*?\{[^}]*\}",
         r"\\hspace\*?\{[^}]*\}",
+        r"\\vskip\s*-?[\d.]+\s*(?:pt|em|ex|cm|mm|in|bp)?(?:\s*plus\s*-?[\d.]+\s*\w+)?(?:\s*minus\s*-?[\d.]+\s*\w+)?",
         r"\\smallskip\b",
         r"\\medskip\b",
         r"\\bigskip\b",
     ]
+    # Float environments whose placement option ([htbp], [!t], ...) is dropped
+    FLOAT_ENVIRONMENTS = (
+        "figure\\*?|table\\*?|algorithm\\*?|wrapfigure|sidewaysfigure|sidewaystable"
+    )
+    # Display environments with alignment points (&, \\) need an inner
+    # environment once they become `equation`, or the LaTeX would be invalid.
+    INNER_ALIGNMENT_ENV = {
+        "align": "aligned",
+        "align*": "aligned",
+        "flalign": "aligned",
+        "flalign*": "aligned",
+        "eqnarray": "aligned",
+        "eqnarray*": "aligned",
+        "gather": "gathered",
+        "gather*": "gathered",
+        "multline": "multlined",
+        "multline*": "multlined",
+    }
     BLOCK_MATH_ENVIRONMENTS = (
         "equation\\*?|align\\*?|gather\\*?|multline\\*?|"
         "eqnarray\\*?|flalign\\*?|displaymath"
@@ -44,10 +77,83 @@ class HierarchyNormalizer:
         re.DOTALL,
     )
 
+    @staticmethod
+    def _read_braced(text: str, open_pos: int) -> tuple[Optional[str], int]:
+        """Content of the brace group opening at ``open_pos`` and the index after it."""
+        if open_pos >= len(text) or text[open_pos] != "{":
+            return None, open_pos
+        depth, pos = 0, open_pos
+        while pos < len(text):
+            char = text[pos]
+            if char == "\\":
+                pos += 2
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[open_pos + 1:pos], pos + 1
+            pos += 1
+        return None, open_pos
+
+    @classmethod
+    def _unwrap_command(cls, text: str, name: str, dropped_args: int) -> str:
+        """Replace ``\\name{a1}..{an}{X}`` by ``X`` (layout wrappers such as \\resizebox)."""
+        pattern = re.compile(rf"\\{name}\*?\s*")
+        out, pos = [], 0
+        for match in pattern.finditer(text):
+            if match.start() < pos:
+                continue
+            cursor = match.end()
+            values = []
+            for _ in range(dropped_args + 1):
+                while cursor < len(text) and text[cursor].isspace():
+                    cursor += 1
+                value, cursor_next = cls._read_braced(text, cursor)
+                if value is None:
+                    break
+                values.append(value)
+                cursor = cursor_next
+            if len(values) != dropped_args + 1:
+                continue
+            out.append(text[pos:match.start()])
+            out.append(values[-1])
+            pos = cursor
+        out.append(text[pos:])
+        return "".join(out)
+
+    @classmethod
+    def _replace_outside_inline_math(cls, text: str, func) -> str:
+        """Apply ``func`` only to the parts of ``text`` that are not inside $...$."""
+        parts = re.split(r"((?<!\\)\$(?:\\.|[^$\\])+(?<!\\)\$)", text)
+        return "".join(
+            part if index % 2 else func(part) for index, part in enumerate(parts)
+        )
+
+    @classmethod
+    def _ensuremath_to_dollars(cls, text: str) -> str:
+        out, pos = [], 0
+        for match in re.finditer(r"\\ensuremath\s*", text):
+            if match.start() < pos:
+                continue
+            value, end = cls._read_braced(text, match.end())
+            if value is None:
+                continue
+            out.append(text[pos:match.start()])
+            out.append(f"${value}$")
+            pos = end
+        out.append(text[pos:])
+        return "".join(out)
+
     @classmethod
     def standardize_math(cls, text: str) -> str:
         """Normalize inline and display math delimiters for comparison."""
         text = re.sub(r"\\\((.*?)\\\)", r"$\1$", text, flags=re.DOTALL)
+        text = re.sub(
+            r"\\begin\{math\}(.*?)\\end\{math\}", r"$\1$", text, flags=re.DOTALL
+        )
+        text = cls._replace_outside_inline_math(text, cls._ensuremath_to_dollars)
         text = re.sub(
             r"\$\$(.*?)\$\$",
             lambda match: (
@@ -74,10 +180,12 @@ class HierarchyNormalizer:
         for command in cls.CLEANUP_COMMANDS:
             text = re.sub(command, "", text)
         text = re.sub(
-            r"\\begin\{(?:figure|table)\*?\}\s*\[[^\]]*\]",
+            rf"\\begin\{{(?:{cls.FLOAT_ENVIRONMENTS})\}}\s*\[[^\]]*\]",
             lambda match: match.group(0).split("[")[0],
             text,
         )
+        text = cls._unwrap_command(text, "resizebox", 2)
+        text = cls._unwrap_command(text, "scalebox", 1)
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r"\n\s*\n+", "\n\n", text)
         return text.strip()
@@ -121,7 +229,17 @@ class HierarchyNormalizer:
                 continue
 
             body = content[frame["body_start"]:match.start()].strip()
-            replacement = f"\\begin{{equation}}\n{body}\n\\end{{equation}}"
+            inner = cls.INNER_ALIGNMENT_ENV.get(env)
+            if inner and ("&" in body or "\\\\" in body):
+                if env.startswith("eqnarray"):
+                    # eqnarray rows are "lhs &=& rhs": keep one alignment point
+                    body = re.sub(r"&([^&\n]*?)&", r"&\1", body)
+                replacement = (
+                    f"\\begin{{equation}}\n\\begin{{{inner}}}\n{body}\n"
+                    f"\\end{{{inner}}}\n\\end{{equation}}"
+                )
+            else:
+                replacement = f"\\begin{{equation}}\n{body}\n\\end{{equation}}"
             replacements.append((frame["start"], match.end(), replacement))
 
         for start, end, replacement in reversed(replacements):

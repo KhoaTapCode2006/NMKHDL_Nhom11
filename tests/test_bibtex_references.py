@@ -5,7 +5,6 @@ import unittest
 from pathlib import Path
 
 from src.parser.dedup import ReferenceDeduplicator
-from src.parser.hierarchy_builder import HierarchyBuilder
 from src.run_hierarchy import process_publication_hierarchy
 
 
@@ -134,166 +133,137 @@ class BibtexReferenceTests(unittest.TestCase):
         self.assertEqual(result["entry_type"], "booklet")
 
     def test_extracts_complete_reference_metadata_and_serializes_valid_bibtex(self):
-        reference = {
-            "citation_key": "doe2022",
-            "label": "",
-            "content": (
+        entry = ReferenceDeduplicator.parse_bibitem_entries(
+            [
+                r"\bibitem{doe2022} "
                 r"\bibinfo{author}{Jane Doe and John Smith}. "
                 r"\bibinfo{title}{A {Nested}, Reliable Parser & Tests}. "
                 r"\bibinfo{journal}{Journal of Data Tests}. "
                 r"\bibinfo{year}{2022}. "
                 r"\bibinfo{doi}{10.1234/example.2022}. "
                 r"\url{https://example.org/paper}."
-            ),
-        }
+            ],
+            "2301.01234",
+            "v1",
+        )[0]
 
-        record = HierarchyBuilder.extract_reference_fields(reference, "2301.01234")
-        bibtex = HierarchyBuilder.convert_references_to_bibtex([reference])[0]
+        self.assertEqual(entry["citation_key"], "doe2022")
+        self.assertEqual(entry["title"], "A Nested, Reliable Parser & Tests")
+        self.assertEqual(entry["authors"], ["Jane Doe", "John Smith"])
+        self.assertEqual(entry["year"], 2022)
+        self.assertEqual(entry["doi"], "10.1234/example.2022")
+        self.assertEqual(entry["journal"], "Journal of Data Tests")
+        self.assertEqual(entry["url"], "https://example.org/paper")
 
-        self.assertEqual(
-            record,
-            {
-                "arxiv_id": "2301.01234",
-                "citation_key": "doe2022",
-                "entry_type": "misc",
-                "title": "A Nested, Reliable Parser & Tests",
-                "authors": ["Jane Doe", "John Smith"],
-                "year": 2022,
-                "doi": "10.1234/example.2022",
-                "journal": "Journal of Data Tests",
-                "url": "https://example.org/paper",
-            },
-        )
-        self.assertIn("@misc{doe2022,", bibtex)
+        bibtex = ReferenceDeduplicator.entry_to_bibtex(entry)
+        self.assertIn("@article{doe2022,", bibtex)
         self.assertIn("author = {Jane Doe and John Smith}", bibtex)
         self.assertIn(r"title = {A Nested, Reliable Parser \& Tests}", bibtex)
-        self.assertIn("note =", bibtex)
         parsed = assert_valid_bibtex(self, bibtex)
-        self.assertEqual(parsed[0][0], "misc")
         self.assertEqual(parsed[0][1], "doe2022")
         self.assertIn("title", parsed[0][2])
 
     def test_partial_and_unstructured_references_do_not_invent_fields(self):
-        partial = {
-            "citation_key": "partial",
-            "label": "",
-            "content": "Jane Doe. An Identifiable Study. 2021.",
-        }
-        unstructured = {
-            "citation_key": "raw",
-            "label": "",
-            "content": "unstructured-reference-without-fields",
-        }
-
-        partial_record = HierarchyBuilder.extract_reference_fields(
-            partial, "2301.01234"
+        partial, raw = ReferenceDeduplicator.parse_bibitem_entries(
+            [
+                r"\bibitem{partial} Jane Doe. An Identifiable Study. 2021.",
+                r"\bibitem{raw} unstructured-reference-without-fields",
+            ],
+            "2301.01234",
+            "v1",
         )
-        raw_record = HierarchyBuilder.extract_reference_fields(
-            unstructured, "2301.01234"
-        )
-        raw_bibtex = HierarchyBuilder.convert_references_to_bibtex([unstructured])[0]
 
-        self.assertEqual(partial_record["title"], "An Identifiable Study")
-        self.assertEqual(partial_record["authors"], ["Jane Doe"])
-        self.assertEqual(partial_record["year"], 2021)
-        self.assertIsNone(partial_record["doi"])
-        self.assertIsNone(partial_record["url"])
-        self.assertIsNone(partial_record["journal"])
-        self.assertIsNone(raw_record["title"])
-        self.assertEqual(raw_record["authors"], [])
-        self.assertIn("note = {unstructured-reference-without-fields}", raw_bibtex)
-        self.assertEqual(assert_valid_bibtex(self, raw_bibtex)[0][2]["note"],
-                         "unstructured-reference-without-fields")
+        self.assertEqual(partial["title"], "An Identifiable Study")
+        self.assertEqual(partial["authors"], ["Jane Doe"])
+        self.assertEqual(partial["year"], 2021)
+        self.assertEqual(partial["doi"], "")
+        self.assertEqual(partial["url"], "")
+        self.assertEqual(partial["journal"], "")
+        self.assertEqual(raw["title"], "")
+        self.assertEqual(raw["authors"], [])
+        raw_bibtex = ReferenceDeduplicator.entry_to_bibtex(raw)
+        self.assertIn("@misc{raw,", raw_bibtex)
+        self.assertEqual(
+            assert_valid_bibtex(self, raw_bibtex)[0][2]["note"],
+            "unstructured-reference-without-fields",
+        )
 
     def test_deduplicates_versions_merges_fields_and_remaps_citations(self):
-        refs = {
-            "v1": [
-                {
-                    "citation_key": "original_key",
-                    "label": "",
-                    "content": (
-                        "Jane Doe. A Reliable Study. Journal of Tests, 2021."
-                    ),
-                },
-                {
-                    "citation_key": "duplicate_key",
-                    "label": "",
-                    "content": (
-                        "Jane Doe. A Reliable Study. Journal of Tests, 2021."
-                    ),
-                },
-            ],
-            "v2": [
-                {
-                    "citation_key": "renamed_key",
-                    "label": "",
-                    "content": (
-                        "Jane Doe. A Reliable Study. Journal of Tests, 2021. "
-                        "doi:10.1234/reliable"
-                    ),
-                }
-            ],
-            "v3": [
-                {
-                    "citation_key": "renamed_key",
-                    "label": "",
-                    "content": (
-                        r"\bibinfo{author}{Jane Doe}. "
-                        r"\bibinfo{title}{A Reliable Study}. "
-                        r"\bibinfo{doi}{10.1234/reliable}."
-                    ),
-                }
-            ],
-        }
-
-        result = HierarchyBuilder.deduplicate_references_by_version(
-            "2301.01234", refs
+        parse = ReferenceDeduplicator.parse_bibitem_entries
+        entries = (
+            parse(
+                [
+                    r"\bibitem{original_key} Jane Doe. A Reliable Study of Parsers. "
+                    "Journal of Tests, 2021.",
+                    r"\bibitem{duplicate_key} Jane Doe. A Reliable Study of Parsers. "
+                    "Journal of Tests, 2021.",
+                ],
+                "2301.01234",
+                "v1",
+            )
+            + parse(
+                [
+                    r"\bibitem{renamed_key} Jane Doe. A Reliable Study of Parsers. "
+                    "Journal of Tests, 2021. doi:10.1234/reliable",
+                ],
+                "2301.01234",
+                "v2",
+            )
+            + parse(
+                [
+                    r"\bibitem{renamed_key} \bibinfo{author}{Jane Doe}. "
+                    r"\bibinfo{title}{A Reliable Study of Parsers}. "
+                    r"\bibinfo{doi}{10.1234/reliable}.",
+                ],
+                "2301.01234",
+                "v3",
+            )
         )
-        record = result["entries"][0]
 
-        self.assertEqual(len(result["entries"]), 1)
+        result = ReferenceDeduplicator.deduplicate_bibtex("2301.01234", entries)
+        self.assertEqual(len(result["bibtex"]), 1)
+        record = result["bibtex"][0]
         self.assertEqual(record["citation_key"], "original_key")
-        self.assertEqual(record["arxiv_id"], "2301.01234")
-        self.assertEqual(record["title"], "A Reliable Study")
+        self.assertEqual(record["title"], "A Reliable Study of Parsers")
         self.assertEqual(record["authors"], ["Jane Doe"])
         self.assertEqual(record["year"], 2021)
         self.assertEqual(record["doi"], "10.1234/reliable")
         self.assertEqual(record["journal"], "Journal of Tests")
         self.assertEqual(
             set(record),
-            {
-                "arxiv_id",
-                "citation_key",
-                "entry_type",
-                "title",
-                "authors",
-                "year",
-                "doi",
-                "journal",
-                "url",
-            },
+            {"arxiv_id", "citation_key", "entry_type", "title", "authors",
+             "year", "doi", "journal", "url"},
         )
-        self.assertEqual(
-            result["aliases_by_version"]["v2"]["renamed_key"],
-            "original_key",
+        by_version = result["key_mapping_by_version"]
+        self.assertEqual(by_version["v1"]["duplicate_key"], "original_key")
+        self.assertEqual(by_version["v2"]["renamed_key"], "original_key")
+        rewritten, _, _ = ReferenceDeduplicator.rewrite_citations_in_text(
+            r"\citep[see][p. 4]{renamed_key, other}", by_version["v2"]
         )
-        self.assertEqual(
-            result["aliases_by_version"]["v1"]["duplicate_key"],
-            "original_key",
-        )
-        self.assertEqual(
-            HierarchyBuilder.remap_citation_keys(
-                r"\citep[see][p. 4]{renamed_key, other} % \cite{renamed_key}",
-                result["aliases_by_version"]["v2"],
-            ),
-            r"\citep[see][p. 4]{original_key, other} % \cite{renamed_key}",
-        )
-        for entries in result["bibtex_by_version"].values():
-            self.assertEqual(len(entries), 1)
-            self.assertIn("@misc{original_key,", entries[0])
-            assert_valid_bibtex(self, entries[0])
+        self.assertEqual(rewritten, r"\citep[see][p. 4]{original_key, other}")
 
-    def test_publication_writes_unified_schema_and_versioned_canonical_bibtex(self):
+    def test_reused_key_for_another_paper_is_remapped_per_version(self):
+        parse = ReferenceDeduplicator.parse_bibitem_entries
+        entries = parse(
+            [r"\bibitem{ref1} Alice Brown. Graph Neural Networks for Molecules. 2019."],
+            "p", "v1",
+        ) + parse(
+            [r"\bibitem{ref1} Carol White. Quantum Error Correction Codes. 2023."],
+            "p", "v2",
+        )
+
+        result = ReferenceDeduplicator.deduplicate_bibtex("p", entries)
+        by_version = result["key_mapping_by_version"]
+
+        self.assertEqual(len(result["bibtex"]), 2)
+        self.assertEqual(by_version["v1"]["ref1"], "ref1")
+        self.assertEqual(by_version["v2"]["ref1"], "ref1_v2")
+        rewritten, _, _ = ReferenceDeduplicator.rewrite_citations_in_text(
+            r"\cite{ref1}", by_version["v2"]
+        )
+        self.assertEqual(rewritten, r"\cite{ref1_v2}")
+
+    def test_publication_writes_unified_schema_and_canonical_bibtex_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             publication = Path(temp_dir) / "2301.01234"
             elements = publication / "elements"
@@ -303,70 +273,75 @@ class BibtexReferenceTests(unittest.TestCase):
             (elements / "full_inlined_v1.tex").write_text(
                 r"\begin{document}\cite{old_key} We use this work."
                 r"\begin{thebibliography}{9}"
-                r"\bibitem{old_key} Jane Doe. Stable Title. Journal of Tests, 2021."
+                r"\bibitem{old_key} Jane Doe. Stable Title of the Study. Journal of Tests, 2021."
                 r"\end{thebibliography}\end{document}",
                 encoding="utf-8",
             )
             (elements / "full_inlined_v2.tex").write_text(
                 r"\begin{document}\cite{new_key} We use this work."
                 r"\begin{thebibliography}{9}"
-                r"\bibitem{new_key} Jane Doe. Stable Title. Journal of Tests, 2021. "
+                r"\bibitem{new_key} Jane Doe. Stable Title of the Study. Journal of Tests, 2021. "
                 r"doi:10.1234/stable"
                 r"\end{thebibliography}\end{document}",
                 encoding="utf-8",
             )
 
             result = process_publication_hierarchy(publication)
-            table = json.loads((elements / "bibtex.json").read_text(encoding="utf-8"))
+            bibtex_dir = publication / "bibtex"
+            table = json.loads((bibtex_dir / "bibtex.json").read_text(encoding="utf-8"))
             version_elements = json.loads(
                 (elements / "elements_v2.json").read_text(encoding="utf-8")
             )
-            csv_text = (elements / "bibtex.csv").read_text(encoding="utf-8-sig")
-            rewritten = (elements / "full_inlined_v2.tex").read_text(
-                encoding="utf-8"
-            )
-            version_bib = (elements / "references_v2.bib").read_text(
-                encoding="utf-8"
-            )
+            csv_text = (bibtex_dir / "bibtex.csv").read_text(encoding="utf-8-sig")
+            bib_file = (bibtex_dir / "bibtex.bib").read_text(encoding="utf-8")
 
             self.assertEqual(result["bibtex_entries_count"], 1)
             self.assertEqual(len(table), 1)
-            self.assertEqual(table[0]["arxiv_id"], "2301.01234")
             self.assertEqual(table[0]["citation_key"], "old_key")
             self.assertEqual(table[0]["doi"], "10.1234/stable")
-            self.assertIn("arxiv_id,citation_key,entry_type,title,authors,year,doi,journal,url",
-                          csv_text)
-            self.assertIn('"[""Jane Doe""]"', csv_text)
-            self.assertNotIn("arxiv_id =", version_bib)
-            self.assertIn("@misc{old_key,", version_bib)
-            self.assertIn(r"\cite{old_key}", rewritten)
+            self.assertIn(
+                "arxiv_id,citation_key,entry_type,title,authors,year,doi,journal,url",
+                csv_text,
+            )
+            self.assertFalse((elements / "bibtex.json").exists())
+            self.assertIn("{old_key,", bib_file)
+            self.assertNotIn("arxiv_id =", bib_file)
+            assert_valid_bibtex(self, bib_file)
             self.assertTrue(
-                any(
-                    r"\cite{old_key}" in element["content"]
-                    for element in version_elements
-                )
+                any(r"\cite{old_key}" in e["content"] for e in version_elements)
             )
             self.assertFalse(
-                any(
-                    r"\cite{new_key}" in element["content"]
-                    for element in version_elements
-                )
+                any(r"\cite{new_key}" in e["content"] for e in version_elements)
             )
-            self.assertEqual(
-                set(table[0]),
-                {
-                    "arxiv_id",
-                    "citation_key",
-                    "entry_type",
-                    "title",
-                    "authors",
-                    "year",
-                    "doi",
-                    "journal",
-                    "url",
-                },
+
+    def test_bibliography_command_selects_bib_file_and_uncited_entries_are_dropped(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            publication = Path(temp_dir) / "paper"
+            version = publication / "v1"
+            version.mkdir(parents=True)
+            (version / "main.tex").write_text(
+                "\\documentclass{article}\n\\begin{document}\n"
+                "We follow \\cite{used} closely.\n"
+                "\\bibliography{refs}\n\\end{document}\n",
+                encoding="utf-8",
             )
-            assert_valid_bibtex(self, version_bib)
+            (version / "refs.bib").write_text(
+                "@article{used, title={A Paper That Is Cited Here}, year={2020}}\n"
+                "@article{unused, title={A Paper Nobody Cites At All}, year={2021}}\n",
+                encoding="utf-8",
+            )
+            (version / "template-sample.bib").write_text(
+                "@article{template, title={Template Example Entry Title}, year={2000}}\n",
+                encoding="utf-8",
+            )
+
+            result = process_publication_hierarchy(publication)
+            table = json.loads(
+                (publication / "bibtex" / "bibtex.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual([row["citation_key"] for row in table], ["used"])
+        self.assertEqual(result["bibtex_stats"]["uncited_bib_entries_dropped"], 1)
 
 
 if __name__ == "__main__":

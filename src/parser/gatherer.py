@@ -32,6 +32,15 @@ class MultiFileGatherer:
         r")"
     )
 
+    # \input targets with these extensions are never .tex sources (TikZ/PGF
+    # pictures, compiled bibliographies, data tables). Milestone 1 keeps only
+    # .tex/.bib files, so they are always absent; missing them is not an error.
+    NON_TEX_INPUT_EXTENSIONS = {
+        ".tikz", ".pgf", ".pgf_t", ".pdf_t", ".pstex_t", ".eps_tex", ".pdf_tex",
+        ".bbl", ".txt", ".csv", ".dat", ".sty", ".cls", ".clo", ".cfg", ".def",
+        ".table", ".tab", ".fig", ".svg", ".png", ".jpg", ".pdf", ".eps",
+    }
+
     STANDARD_ROOT_NAMES = {
         "main.tex",
         "paper.tex",
@@ -50,6 +59,12 @@ class MultiFileGatherer:
         "referee",
         "cover_letter",
     }
+
+    @classmethod
+    def is_non_tex_input(cls, target_str: str) -> bool:
+        """True for \\input targets that can never be a .tex source file."""
+        suffix = PurePosixPath(target_str.strip().replace("\\", "/")).suffix.lower()
+        return suffix in cls.NON_TEX_INPUT_EXTENSIONS
 
     @classmethod
     def strip_comments(cls, text: str) -> str:
@@ -248,6 +263,7 @@ class MultiFileGatherer:
                 "orphan_files": [],
                 "inlined_content": "",
                 "unresolved_includes": [],
+                "skipped_non_tex_includes": [],
                 "cycle_errors": [],
                 "read_errors": [],
                 "error": "No .tex files found in version directory (empty version)",
@@ -263,6 +279,7 @@ class MultiFileGatherer:
                 "orphan_files": [f.resolve() for f in all_tex_files],
                 "inlined_content": "",
                 "unresolved_includes": [],
+                "skipped_non_tex_includes": [],
                 "cycle_errors": [],
                 "read_errors": [],
                 "error": "Failed to identify root .tex file (no valid \\documentclass or \\documentstyle)",
@@ -284,6 +301,7 @@ class MultiFileGatherer:
         compilation_files: List[Path] = []
 
         unresolved_includes: List[str] = []
+        skipped_non_tex_includes: List[str] = []
         cycle_errors: List[str] = []
         read_errors: List[str] = []
 
@@ -313,6 +331,10 @@ class MultiFileGatherer:
 
             try:
                 for line in content.splitlines(keepends=True):
+                    # Includes are searched in the comment-free text only, so a
+                    # commented-out \input stays plain text. Comment stripping
+                    # removes a suffix, so match offsets are also valid in `line`,
+                    # and the untouched original text is copied around matches.
                     clean_line = cls.strip_comments(line)
                     matches = list(cls.INPUT_INCLUDE_PATTERN.finditer(clean_line))
 
@@ -329,7 +351,7 @@ class MultiFileGatherer:
                         cmd_type = match.group(1) or match.group(3) or match.group(5)
                         target_str = (match.group(2) or match.group(4) or match.group(6) or "").strip()
 
-                        line_parts.append(clean_line[last_idx:start_char])
+                        line_parts.append(line[last_idx:start_char])
                         last_idx = end_char
 
                         # Check \includeonly constraint for \include commands
@@ -355,14 +377,22 @@ class MultiFileGatherer:
                                 f"{inlined_child}\n"
                                 f"% --- END {cmd_type.upper()}: {resolved_path.name} ---\n"
                             )
+                        elif cls.is_non_tex_input(target_str):
+                            skipped_non_tex_includes.append(target_str)
+                            line_parts.append(
+                                f"\n% [Skipped non-TeX input: {target_str}]\n"
+                            )
                         else:
                             unresolved_includes.append(target_str)
                             line_parts.append(
                                 f"\n% [Unresolved include: {target_str}]\n"
                             )
 
-                    line_parts.append(clean_line[last_idx:])
-                    output_lines.append("".join(line_parts) + "\n")
+                    rest = line[last_idx:]
+                    line_parts.append(rest)
+                    if not rest.endswith("\n"):
+                        line_parts.append("\n")
+                    output_lines.append("".join(line_parts))
             finally:
                 call_stack.pop()
 
@@ -401,6 +431,7 @@ class MultiFileGatherer:
             "orphan_files": orphan_files,
             "inlined_content": inlined_content,
             "unresolved_includes": unresolved_includes,
+            "skipped_non_tex_includes": skipped_non_tex_includes,
             "cycle_errors": cycle_errors,
             "read_errors": read_errors,
             "error": error_msg,

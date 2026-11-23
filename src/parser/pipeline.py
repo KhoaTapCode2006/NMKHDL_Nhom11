@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,7 +25,7 @@ class ParsingPipeline:
     def __init__(
         self,
         source_dir: str | Path,
-        clean_redundant_tex: bool = True,
+        clean_redundant_tex: bool = False,
         benchmark: Optional[ParserBenchmark] = None,
     ):
         self.source_dir = Path(source_dir).resolve()
@@ -130,7 +131,7 @@ class ParsingPipeline:
         ):
             was_successful = (
                 previous_manifest is None
-                or previous_manifest.get("status") == "success"
+                or previous_manifest.get("status") in {"success", "partial"}
             )
             if was_successful:
                 inlined_content = inlined_path.read_text(encoding="utf-8")
@@ -154,6 +155,20 @@ class ParsingPipeline:
                         "read_errors": [],
                         "error": None,
                     }
+
+        # An incomplete gather (a missing included .tex file, a cycle, a read
+        # error) still yields the document body when the root was found. Parse it
+        # and mark the version "partial" instead of discarding the whole version.
+        status = "success"
+        warning: Optional[str] = None
+        if (
+            not gather_res["success"]
+            and gather_res.get("root_file")
+            and "\\begin{document}" in gather_res.get("inlined_content", "")
+        ):
+            status = "partial"
+            warning = gather_res["error"]
+            gather_res = {**gather_res, "success": True}
 
         if not gather_res["success"]:
             error = gather_res["error"] or "Gather failed without an error message."
@@ -210,15 +225,16 @@ class ParsingPipeline:
         self.benchmark.record_version(
             arxiv_id=arxiv_id,
             version=version_name,
-            status="success",
+            status=status,
             duration_sec=time.perf_counter() - start_time,
+            error_msg=warning,
             compilation_files_count=len(gather_res["compilation_files"]),
             elements_count=len(elements),
         )
         return {
             "success": True,
-            "status": "success",
-            "error": None,
+            "status": status,
+            "error": warning,
             "gather_res": gather_res,
             "elements": elements,
             "hierarchy": hierarchy,
@@ -271,6 +287,7 @@ class ParsingPipeline:
         compilation_manifest: Dict[str, Any] = {}
         gather_results: Dict[str, Dict[str, Any]] = {}
         successful_versions = 0
+        partial_versions = 0
         empty_versions = 0
         failed_versions = 0
 
@@ -299,6 +316,7 @@ class ParsingPipeline:
 
             if result["success"]:
                 successful_versions += 1
+                partial_versions += int(result["status"] == "partial")
                 gather_results[version_name] = gather_res
                 inline_path.write_text(
                     gather_res["inlined_content"],
@@ -310,7 +328,8 @@ class ParsingPipeline:
                     raw_elements=result["elements"],
                     raw_hierarchy=result["hierarchy"],
                     is_empty=False,
-                    status="success",
+                    error_msg=result["error"],
+                    status=result["status"],
                 )
                 self._write_json(
                     elements_dir / f"pre_dedup_elements_{version_name}.json",
@@ -321,7 +340,12 @@ class ParsingPipeline:
                     result["hierarchy"],
                 )
                 compilation_manifest[version_name] = {
-                    "status": "success",
+                    "status": result["status"],
+                    "warning": result["error"],
+                    "unresolved_includes": list(gather_res.get("unresolved_includes", [])),
+                    "skipped_non_tex_includes": list(
+                        gather_res.get("skipped_non_tex_includes", [])
+                    ),
                     "is_empty": False,
                     "root_file": (
                         (
@@ -416,6 +440,7 @@ class ParsingPipeline:
             "arxiv_id": arxiv_id,
             "total_versions": len(versions),
             "successful_versions": successful_versions,
+            "partial_versions": partial_versions,
             "empty_versions": empty_versions,
             "failed_versions": failed_versions,
             "version_names": [name for name, _ in versions],
@@ -508,6 +533,7 @@ class ParsingPipeline:
             empty_versions=build_result["empty_versions"],
             dedup_stats=element_stats,
             duration_sec=duration,
+            bibtex_stats=dedup_result["bibtex_dedup"],
         )
         return {
             "arxiv_id": build_result["arxiv_id"],
@@ -518,6 +544,7 @@ class ParsingPipeline:
             "bibtex_stats": dedup_result["bibtex_dedup"],
             "total_versions": build_result["total_versions"],
             "tex_versions": build_result["successful_versions"],
+            "partial_versions": build_result["partial_versions"],
             "empty_versions": build_result["empty_versions"],
             "failed_versions": build_result["failed_versions"],
             "normalized_trees": [str(path) for path in normalized_trees],
@@ -549,6 +576,9 @@ class ParsingPipeline:
                 )
         finally:
             self.benchmark.stop()
+        self.benchmark.measure_output(
+            path / sub for path in pub_dirs for sub in ("elements", "bibtex")
+        )
         return self.benchmark.generate_summary()
 
 
@@ -571,15 +601,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--clean-tex",
         dest="clean_tex",
         action="store_true",
-        default=True,
-        help="Delete redundant/orphan TeX files after processing (default).",
+        default=False,
+        help=(
+            "Delete the original TeX files after processing. Off by default: the "
+            "Milestone 1 corpus is the input of every later re-run."
+        ),
     )
     parser.add_argument(
         "--no-clean-tex",
         dest="clean_tex",
         action="store_false",
-        default=True,
-        help="Keep original TeX files after processing.",
+        help="Keep the original TeX files (the default; kept for compatibility).",
+    )
+    parser.add_argument(
+        "--trace-memory",
+        action="store_true",
+        help="Also measure peak heap with tracemalloc (slows the run; not for timing).",
     )
     parser.add_argument(
         "--report-md",
@@ -604,12 +641,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    # The report is Vietnamese; a Windows console (cp1252) cannot encode it.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     source_dir = args.source_dir.resolve()
     if not source_dir.is_dir():
         print(f"Error: Source directory does not exist: {source_dir}")
         return 1
 
-    benchmark = ParserBenchmark()
+    benchmark = ParserBenchmark(trace_memory=args.trace_memory)
     pipeline = ParsingPipeline(
         source_dir=source_dir,
         clean_redundant_tex=args.clean_tex,
@@ -640,6 +680,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     finally:
         benchmark.stop()
 
+    benchmark.measure_output(
+        path / sub for path in pub_dirs for sub in ("elements", "bibtex")
+    )
     summary = benchmark.generate_summary()
     report = benchmark.export_markdown_report(args.report_md)
     args.stats_json.parent.mkdir(parents=True, exist_ok=True)

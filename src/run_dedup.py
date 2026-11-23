@@ -1,5 +1,5 @@
 """
-Script thực thi nhiệm vụ Khử Trùng Lặp (Deduplication - Phần của Kiệt) cho Milestone 2:
+Script thực thi nhiệm vụ Khử Trùng Lặp (Deduplication) cho Milestone 2:
 1. Khử trùng lặp Reference Entries (BibTeX & \\bibitem) trong cùng version và xuyên version,
    hợp nhất các trường thông tin (field unionization) và lưu vào thư mục `bibtex/`.
 2. Đổi tên toàn bộ các lệnh trích dẫn `\\cite{...}` trong `elements` sang `citation_key` chuẩn.
@@ -11,6 +11,7 @@ Script thực thi nhiệm vụ Khử Trùng Lặp (Deduplication - Phần của 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -74,7 +75,7 @@ def main(argv=None) -> None:
         pub_dirs = pub_dirs[: args.limit]
 
     print("=" * 78)
-    print("  MILESTONE 2: REFERENCE & FULL-TEXT DEDUPLICATION (NHIỆM VỤ: KIỆT)")
+    print("  MILESTONE 2: REFERENCE & FULL-TEXT DEDUPLICATION")
     print(f"  Thư mục dữ liệu: {source_path}")
     print(f"  Tổng số bài báo: {len(pub_dirs)}")
     print("=" * 78)
@@ -152,6 +153,44 @@ def main(argv=None) -> None:
         f"Hợp nhất bổ sung trường cho {total_enriched_entries} entries"
     )
     print("=" * 78)
+
+    summary = {
+        "publications": len(pub_dirs),
+        "elapsed_sec": round(elapsed, 3),
+        "elements": {
+            "before": total_elems_before,
+            "after": total_elems_after,
+            "removed": elems_removed,
+            "reduction_percentage": elems_red_pct,
+            "by_kind_before": by_kind_before_global,
+            "by_kind_after": by_kind_after_global,
+        },
+        "bibtex": {
+            "before": total_bib_before,
+            "after": total_bib_after,
+            "removed": bib_removed,
+            "reduction_percentage": bib_red_pct,
+            "renamed_keys": total_renamed_keys,
+            "entries_enriched": total_enriched_entries,
+            "cite_commands_updated": total_cite_cmds_updated,
+        },
+        "per_publication": [
+            {
+                "arxiv_id": res["arxiv_id"],
+                "total_versions": res["total_versions"],
+                "tex_versions": res["tex_versions"],
+                "empty_versions": res["empty_versions"],
+                "failed_versions": res["failed_versions"],
+                "elements_dedup": res["elements_dedup"],
+                "bibtex_dedup": res["bibtex_dedup"],
+            }
+            for res in pub_results
+        ],
+    }
+    summary_path = Path(args.summary_json)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"  Summary JSON: {summary_path}")
 
 
 if __name__ == "__main__":
