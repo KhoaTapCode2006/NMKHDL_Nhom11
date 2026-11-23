@@ -8,7 +8,9 @@ and hierarchy / document-context features from Milestone 2.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -198,7 +200,9 @@ class FeatureExtractor:
         pub_hierarchy = self.hierarchy_summary.get(pub_id, {})
         entry_hierarchy = pub_hierarchy.get(citation_key, {})
         citation_depth = float(entry_hierarchy.get("depth", 1.0))
-        citation_frequency = float(entry_hierarchy.get("frequency", 1.0))
+        # Known publication but key never cited in its text -> frequency 0
+        default_frequency = 0.0 if pub_hierarchy else 1.0
+        citation_frequency = float(entry_hierarchy.get("frequency", default_frequency))
         is_intro_or_related = 1.0 if entry_hierarchy.get("is_intro_or_related", False) else 0.0
 
         return {
@@ -327,59 +331,148 @@ class FeatureExtractor:
         return df
 
 
-def parse_hierarchy_for_features(elements_df: pd.DataFrame, hierarchy_df: pd.DataFrame) -> Dict[str, Dict[str, dict]]:
-    """Helper to extract citation hierarchy depth, section, and frequency from Milestone 2 tables.
+CITE_RE = re.compile(r"\\[A-Za-z]*cite[A-Za-z]*\*?(?:\s*\[[^\]]*\])*\s*\{([^}]*)\}")
+HEADING_KINDS = {
+    "part", "chapter", "section", "subsection", "subsubsection", "paragraph", "subparagraph",
+}
+INTRO_OR_RELATED_RE = re.compile(
+    r"introduction|related|background|prior work|previous work|literature|"
+    r"state of the art|overview|motivation",
+    re.IGNORECASE,
+)
 
-    Returns:
-        Dict: publication_id -> citation_key -> {depth, frequency, is_intro_or_related}
+
+def _first_column(frame: pd.DataFrame, names: Sequence[str]) -> Optional[str]:
+    for name in names:
+        if name in frame.columns:
+            return name
+    return None
+
+
+def parse_hierarchy_for_features(
+    elements_df: pd.DataFrame, hierarchy_df: pd.DataFrame
+) -> Dict[str, Dict[str, dict]]:
+    """Citation context of every citation key, from the Milestone 2 tables.
+
+    ``elements``: element_id, arxiv_id, kind, content (the ``\\cite{...}``
+    commands live inside the content of sentences, items, figures, ...).
+    ``hierarchy``: arxiv_id, version, element_id, parent_id.
+
+    For each (publication, citation key) the summary holds:
+
+    * ``frequency``: number of distinct elements citing the key;
+    * ``depth``: smallest depth of a citing element (root = 0, section = 1, ...);
+    * ``is_intro_or_related``: True when a citing element sits below a heading
+      such as Introduction, Related Work or Background in any version.
+
+    Returns ``{publication_id: {citation_key: {...}}}``.
     """
     summary: Dict[str, Dict[str, dict]] = {}
-    if elements_df.empty or hierarchy_df.empty:
+    if elements_df is None or elements_df.empty:
         return summary
 
-    # Milestone 2 hierarchy node depth and parent mapping
-    depth_map: Dict[str, int] = {}
-    if "child" in hierarchy_df.columns and "parent" in hierarchy_df.columns:
-        parent_map = dict(zip(hierarchy_df["child"], hierarchy_df["parent"]))
-        for node in hierarchy_df["child"]:
-            curr = node
-            d = 1
-            visited = set()
-            while curr in parent_map and curr not in visited and d < 20:
-                visited.add(curr)
-                curr = parent_map[curr]
-                d += 1
-            depth_map[str(node)] = d
+    id_col = _first_column(elements_df, ("element_id", "id"))
+    pub_col = _first_column(elements_df, ("arxiv_id", "publication_id"))
+    content_col = _first_column(elements_df, ("content", "text"))
+    kind_col = _first_column(elements_df, ("kind", "element_type", "type"))
+    if not (id_col and pub_col and content_col):
+        return summary
 
-    # Inspect citations in elements
-    if "element_type" in elements_df.columns or "type" in elements_df.columns:
-        type_col = "element_type" if "element_type" in elements_df.columns else "type"
-        id_col = "element_id" if "element_id" in elements_df.columns else "id"
-        pub_col = "arxiv_id" if "arxiv_id" in elements_df.columns else "publication_id"
-        content_col = "content" if "content" in elements_df.columns else "text"
+    content_by_id = dict(zip(elements_df[id_col].astype(str), elements_df[content_col].astype(str)))
+    kind_by_id = (
+        dict(zip(elements_df[id_col].astype(str), elements_df[kind_col].astype(str)))
+        if kind_col else {}
+    )
+    pub_by_id = dict(zip(elements_df[id_col].astype(str), elements_df[pub_col].astype(str)))
 
-        for _, elem in elements_df.iterrows():
-            elem_type = str(elem.get(type_col) or "").lower()
-            elem_content = str(elem.get(content_col) or "")
-            pub = str(elem.get(pub_col) or "")
-            elem_id = str(elem.get(id_col) or "")
+    # Parent map of every version: (pub, version) -> {child: parent}
+    parent_maps: Dict[Tuple[str, str], Dict[str, str]] = {}
+    if hierarchy_df is not None and not hierarchy_df.empty:
+        child_col = _first_column(hierarchy_df, ("element_id", "child"))
+        parent_col = _first_column(hierarchy_df, ("parent_id", "parent"))
+        version_col = _first_column(hierarchy_df, ("version",))
+        h_pub_col = _first_column(hierarchy_df, ("arxiv_id", "publication_id"))
+        if child_col and parent_col:
+            for row in hierarchy_df.itertuples(index=False):
+                child = str(getattr(row, child_col))
+                pub = str(getattr(row, h_pub_col)) if h_pub_col else pub_by_id.get(child, "")
+                version = str(getattr(row, version_col)) if version_col else "1"
+                parent_maps.setdefault((pub, version), {})[child] = str(getattr(row, parent_col))
 
-            if "cite" in elem_type or "citation" in elem_type:
-                # Key is usually in content
-                c_key = elem_content.strip()
-                if not c_key or not pub:
-                    continue
-                if pub not in summary:
-                    summary[pub] = {}
-                if c_key not in summary[pub]:
-                    summary[pub][c_key] = {
-                        "depth": depth_map.get(elem_id, 1),
-                        "frequency": 1,
-                        "is_intro_or_related": False,
-                    }
-                else:
-                    summary[pub][c_key]["frequency"] += 1
+    def context(element_id: str, parent_map: Dict[str, str]) -> Tuple[int, bool]:
+        depth, intro, node, seen = 0, False, element_id, set()
+        while node in parent_map and node not in seen and depth < 50:
+            seen.add(node)
+            node = parent_map[node]
+            depth += 1
+            if kind_by_id.get(node) in HEADING_KINDS and INTRO_OR_RELATED_RE.search(
+                content_by_id.get(node, "")
+            ):
+                intro = True
+        return depth, intro
 
+    maps_by_pub: Dict[str, List[Dict[str, str]]] = {}
+    for (pub, _version), parent_map in parent_maps.items():
+        maps_by_pub.setdefault(pub, []).append(parent_map)
+
+    for element_id, content in content_by_id.items():
+        if "cite" not in content:
+            continue
+        keys = {
+            key.strip()
+            for match in CITE_RE.finditer(content)
+            for key in match.group(1).split(",")
+            if key.strip()
+        }
+        if not keys:
+            continue
+        pub = pub_by_id.get(element_id, "")
+        depths, intro = [], False
+        for parent_map in maps_by_pub.get(pub, []):
+            if element_id in parent_map:
+                depth, in_intro = context(element_id, parent_map)
+                depths.append(depth)
+                intro = intro or in_intro
+        depth = min(depths) if depths else 1
+        pub_summary = summary.setdefault(pub, {})
+        for key in keys:
+            entry = pub_summary.setdefault(
+                key, {"depth": depth, "frequency": 0, "is_intro_or_related": False}
+            )
+            entry["frequency"] += 1
+            entry["depth"] = min(entry["depth"], depth)
+            entry["is_intro_or_related"] = entry["is_intro_or_related"] or intro
+    return summary
+
+
+def load_hierarchy_summary(
+    source_dir: Path, publications: Optional[Iterable[str]] = None
+) -> Dict[str, Dict[str, dict]]:
+    """Build the citation-context summary from each ``<pub>/elements/`` folder.
+
+    Publications are processed one at a time, so the whole corpus never has to
+    sit in memory as a single elements table.
+    """
+    wanted = {str(p) for p in publications} if publications is not None else None
+    summary: Dict[str, Dict[str, dict]] = {}
+    for pub_dir in sorted(Path(source_dir).iterdir()):
+        if not pub_dir.is_dir() or (wanted is not None and pub_dir.name not in wanted):
+            continue
+        elements_path = pub_dir / "elements" / "elements.json"
+        hierarchy_path = pub_dir / "elements" / "hierarchy.json"
+        if not elements_path.is_file():
+            continue
+        try:
+            elements = pd.DataFrame(json.loads(elements_path.read_text(encoding="utf-8")))
+            hierarchy = (
+                pd.DataFrame(json.loads(hierarchy_path.read_text(encoding="utf-8")))
+                if hierarchy_path.is_file()
+                else pd.DataFrame()
+            )
+        except (OSError, ValueError) as exc:
+            logger.warning("Skipping hierarchy of %s: %s", pub_dir.name, exc)
+            continue
+        summary.update(parse_hierarchy_for_features(elements, hierarchy))
     return summary
 
 
@@ -389,14 +482,19 @@ def main() -> None:
     parser.add_argument("--bibtex-path", type=str, required=True, help="Path to bibtex table")
     parser.add_argument("--references-path", type=str, required=True, help="Path to references table")
     parser.add_argument("--labels-path", type=str, default=None, help="Path to ground truth labels table")
+    parser.add_argument(
+        "--source-dir", type=str, default=None,
+        help="Publication folders with Milestone 2 elements/ (enables citation-context features)",
+    )
     parser.add_argument("--output-path", type=str, required=True, help="Output file path (parquet/csv)")
     args = parser.parse_args()
 
     bib_df = read_table(Path(args.bibtex_path))
     ref_df = read_table(Path(args.references_path))
     labels_df = read_table(Path(args.labels_path)) if args.labels_path else None
+    hierarchy_summary = load_hierarchy_summary(Path(args.source_dir)) if args.source_dir else None
 
-    extractor = FeatureExtractor()
+    extractor = FeatureExtractor(hierarchy_summary=hierarchy_summary)
     feature_matrix = extractor.create_candidate_matrix(bib_df, ref_df, labels_df)
 
     out_path = Path(args.output_path)

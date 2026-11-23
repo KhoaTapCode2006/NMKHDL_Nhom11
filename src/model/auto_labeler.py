@@ -272,25 +272,57 @@ def select_auto_label_publications(
     manual_labeled_publications: Iterable[str],
     ratio: float = 0.10,
     num_members: int = 4,
+    seed: int = 42,
+    groups: Optional[Dict[str, str]] = None,
 ) -> List[str]:
-    """Select at least max(10%, 2*k) publications outside the manual pool.
+    """Select at least max(ceil(10%), 2*k) publications outside the manual pool.
+
+    The publications are drawn at random (reproducible through ``seed``), not
+    taken from the start of the sorted list, which would favour the beginning of
+    one member's ID range. When ``groups`` maps each publication to its member,
+    members are visited in turn so that every member's range is represented.
 
     Args:
         available_publications: All publication IDs available in the dataset.
         manual_labeled_publications: Set of publication IDs used in manual labeling.
         ratio: Minimum fraction of remaining publications to label (default 0.10).
         num_members: Number of group members (default 4, needing 2*k = 8 pubs min).
+        seed: Random seed of the draw.
+        groups: Optional ``{publication_id: member}`` for a balanced draw.
 
     Returns:
-        List of publication IDs selected for automatic labeling.
+        Sorted list of publication IDs selected for automatic labeling.
     """
-    manual_set = set(manual_labeled_publications)
-    remaining = [pid for pid in available_publications if pid not in manual_set]
+    import math
+    import random
 
-    min_required = max(int(len(remaining) * ratio), 2 * num_members)
+    manual_set = set(manual_labeled_publications)
+    remaining = sorted({pid for pid in available_publications if pid not in manual_set})
+
+    # "at least 10 percent": round up, never down
+    min_required = max(math.ceil(len(remaining) * ratio), 2 * num_members)
     selected_count = min(len(remaining), min_required)
 
-    return sorted(remaining[:selected_count])
+    rng = random.Random(seed)
+    if not groups:
+        return sorted(rng.sample(remaining, selected_count))
+
+    buckets: Dict[str, List[str]] = {}
+    for pid in remaining:
+        buckets.setdefault(groups.get(pid, "_unassigned"), []).append(pid)
+    for members in buckets.values():
+        rng.shuffle(members)
+    order = sorted(buckets)
+    selected: List[str] = []
+    while len(selected) < selected_count:
+        progressed = False
+        for member in order:
+            if buckets[member] and len(selected) < selected_count:
+                selected.append(buckets[member].pop())
+                progressed = True
+        if not progressed:
+            break
+    return sorted(selected)
 
 
 def split_publications_train_val_test(
@@ -377,19 +409,65 @@ def run_auto_labeling_pipeline(
         pub_results = matcher.label_publication(pub_bib, pub_ref)
         all_results.extend(pub_results)
 
-    result_df = pd.DataFrame([
-        {
-            "arxiv_id": r.arxiv_id,
-            "citation_key": r.citation_key,
-            "groundtruth_arxiv_id": r.groundtruth_arxiv_id,
-            "matched": r.matched,
-            "method": r.method,
-            "confidence": r.confidence,
-        }
-        for r in all_results
-    ])
+    result_df = pd.DataFrame(
+        [
+            {
+                "arxiv_id": r.arxiv_id,
+                "citation_key": r.citation_key,
+                "groundtruth_arxiv_id": r.groundtruth_arxiv_id,
+                "matched": r.matched,
+                "method": r.method,
+                "confidence": r.confidence,
+                "label_source": "auto",
+            }
+            for r in all_results
+        ],
+        columns=[
+            "arxiv_id", "citation_key", "groundtruth_arxiv_id",
+            "matched", "method", "confidence", "label_source",
+        ],
+    )
 
     return result_df
+
+
+def validate_auto_labels(auto_labels: pd.DataFrame, manual_labels: pd.DataFrame) -> Dict[str, object]:
+    """Compare automatic labels with manual labels on the same entries.
+
+    Run the auto labeler on the manually labeled publications and pass both
+    tables here. Leakage note: the auto labels come from the same title/author
+    similarities that later serve as model features, so a model evaluated on
+    auto-labeled publications looks better than it is; these numbers tell how
+    far the auto labels can be trusted.
+
+    Returns precision (correct among auto matches), recall (manual matches the
+    auto labeler recovered), agreement on "no match", and the entry count.
+    """
+    def norm(value: object) -> Optional[str]:
+        return normalize_arxiv_id(value) if value is not None and not pd.isna(value) else None
+
+    auto = auto_labels[["arxiv_id", "citation_key", "groundtruth_arxiv_id"]].copy()
+    manual = manual_labels[["arxiv_id", "citation_key", "groundtruth_arxiv_id"]].copy()
+    for frame in (auto, manual):
+        frame["arxiv_id"] = frame["arxiv_id"].astype(str)
+        frame["citation_key"] = frame["citation_key"].astype(str)
+        frame["groundtruth_arxiv_id"] = frame["groundtruth_arxiv_id"].map(norm)
+    merged = manual.merge(auto, on=["arxiv_id", "citation_key"], suffixes=("_manual", "_auto"))
+
+    auto_pos = merged["groundtruth_arxiv_id_auto"].notna()
+    manual_pos = merged["groundtruth_arxiv_id_manual"].notna()
+    same = merged["groundtruth_arxiv_id_auto"] == merged["groundtruth_arxiv_id_manual"]
+    correct_pos = int((auto_pos & same).sum())
+    both_neg = int((~auto_pos & ~manual_pos).sum())
+    return {
+        "entries_compared": int(len(merged)),
+        "auto_matches": int(auto_pos.sum()),
+        "manual_matches": int(manual_pos.sum()),
+        "precision": round(correct_pos / auto_pos.sum(), 4) if auto_pos.sum() else None,
+        "recall": round(correct_pos / manual_pos.sum(), 4) if manual_pos.sum() else None,
+        "no_match_agreement": round(both_neg / (~manual_pos).sum(), 4) if (~manual_pos).sum() else None,
+        "accuracy": round(float((same | (~auto_pos & ~manual_pos)).mean()), 4) if len(merged) else None,
+    }
 
 
 def main() -> None:
