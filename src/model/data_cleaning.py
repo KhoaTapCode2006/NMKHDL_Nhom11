@@ -13,12 +13,47 @@ from typing import Iterable, List, Mapping, Optional, Sequence
 import pandas as pd
 
 
-ARXIV_NEW_RE = re.compile(r"\b(?P<id>\d{4}\.\d{4,5})(?:v\d+)?\b")
+# New scheme (April 2007 on): YYMM.NNNN until 1412, YYMM.NNNNN from 1501.
+# The look-behind rejects numbers inside other identifiers, e.g. the DOI
+# "10.1016/j.cell.2020.01234" must not yield "2020.01234".
+ARXIV_NEW_RE = re.compile(
+    r"(?<![\w.])(?P<id>(?P<yymm>\d{4})\.(?P<seq>\d{4,5}))(?:v\d+)?(?![\w.]*\d)"
+)
+# An explicit "arXiv" prefix is trusted even after a dot, as in the arXiv DOI
+# "10.48550/arXiv.2301.12345" or "arXiv:2301.12345".
+ARXIV_PREFIXED_RE = re.compile(
+    r"arxiv(?:\.org/(?:abs|pdf)/|[.:/\s]\s*)(?P<id>\d{4}\.\d{4,5})(?:v\d+)?(?!\d)",
+    re.IGNORECASE,
+)
+# Old scheme (before April 2007): archive[.SC]/YYMMNNN, archives listed explicitly.
+OLD_ARCHIVES = (
+    "acc-phys|adap-org|alg-geom|ao-sci|astro-ph|atom-ph|bayes-an|chao-dyn|chem-ph|"
+    "cmp-lg|comp-gas|cond-mat|cs|dg-ga|funct-an|gr-qc|hep-ex|hep-lat|hep-ph|hep-th|"
+    "math-ph|math|mtrl-th|nlin|nucl-ex|nucl-th|patt-sol|physics|plasm-ph|q-alg|"
+    "q-bio|q-fin|quant-ph|solv-int|stat|supr-con"
+)
 ARXIV_OLD_RE = re.compile(
-    r"\b(?P<id>[a-z\-]+(?:\.[A-Z]{2})?/\d{7})(?:v\d+)?\b",
+    rf"(?<![\w-])(?P<id>(?:{OLD_ARCHIVES})(?:\.[A-Z]{{2}})?/(?P<yymm>\d{{4}})\d{{3}})"
+    r"(?:v\d+)?(?!\d)",
     re.IGNORECASE,
 )
 YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def _valid_new_scheme(yymm: str, seq: str) -> bool:
+    """Month 01-12, not before 0704, 4-digit sequence until 1412 and 5 digits after."""
+    month = int(yymm[2:])
+    if not 1 <= month <= 12 or yymm < "0704":
+        return False
+    return len(seq) == (4 if yymm < "1501" else 5)
+
+
+def _valid_old_scheme(yymm: str) -> bool:
+    """Old identifiers run from 9108 to 0703 with a real month."""
+    year, month = int(yymm[:2]), int(yymm[2:])
+    if not 1 <= month <= 12:
+        return False
+    return year >= 91 or yymm <= "0703"
 
 
 def normalize_arxiv_id(value: object) -> Optional[str]:
@@ -29,9 +64,11 @@ def normalize_arxiv_id(value: object) -> Optional[str]:
     text = re.sub(r"^https?://(?:arxiv\.org/(?:abs|pdf)/)?", "", text, flags=re.I)
     text = re.sub(r"^(?:arxiv:|arxiv/)", "", text, flags=re.I).strip()
     text = re.sub(r"v\d+$", "", text, flags=re.I)
-    if ARXIV_NEW_RE.fullmatch(text):
+    match = ARXIV_NEW_RE.fullmatch(text)
+    if match and _valid_new_scheme(match.group("yymm"), match.group("seq")):
         return text.lower()
-    if ARXIV_OLD_RE.fullmatch(text):
+    match = ARXIV_OLD_RE.fullmatch(text)
+    if match and _valid_old_scheme(match.group("yymm")):
         return text.lower()
     return None
 
@@ -45,12 +82,11 @@ def extract_arxiv_id(*values: object) -> Optional[str]:
         if direct:
             return direct
         text = str(value)
-        match = ARXIV_NEW_RE.search(text)
-        if match:
-            return normalize_arxiv_id(match.group("id"))
-        match = ARXIV_OLD_RE.search(text)
-        if match:
-            return normalize_arxiv_id(match.group("id"))
+        for pattern in (ARXIV_PREFIXED_RE, ARXIV_NEW_RE, ARXIV_OLD_RE):
+            for match in pattern.finditer(text):
+                candidate = normalize_arxiv_id(match.group("id"))
+                if candidate:
+                    return candidate
     return None
 
 
@@ -365,12 +401,49 @@ def collect_bibtex_tables(source_dir: Path) -> pd.DataFrame:
     return combined
 
 
+REFERENCE_COLUMNS = [
+    "citing_arxiv_id",
+    "ref_arxiv_id",
+    "ref_s2_id",
+    "title",
+    "authors",
+    "year",
+    "publication_date",
+    "venue",
+]
+
+
+def _one_references_file_per_paper(source_dir: Path) -> List[Path]:
+    """The crawler copies one reference list into every version: read it once.
+
+    Keeps the lowest version per paper folder (``<paper>/v<N>/references.json``);
+    files outside that layout are all kept.
+    """
+    chosen: dict = {}
+    others: List[Path] = []
+    for path in sorted(Path(source_dir).rglob("references.json")):
+        version_dir = path.parent
+        match = re.fullmatch(r"v(\d+)", version_dir.name)
+        if not match:
+            others.append(path)
+            continue
+        paper_dir = version_dir.parent
+        version = int(match.group(1))
+        if paper_dir not in chosen or version < chosen[paper_dir][0]:
+            chosen[paper_dir] = (version, path)
+    return [path for _version, path in sorted(chosen.values(), key=lambda x: str(x[1]))] + others
+
+
 def flatten_references_json(
     source_dir: Path,
 ) -> pd.DataFrame:
-    """Flatten crawler references.json files for Semantic Scholar API rows."""
+    """Flatten crawler references.json files into one row per arXiv-keyed reference.
+
+    Keeps the Semantic Scholar ``paperId`` (``ref_s2_id``), the publication date
+    and the venue, which the published ``references`` table needs.
+    """
     rows: List[dict] = []
-    for references_path in sorted(source_dir.rglob("references.json")):
+    for references_path in _one_references_file_per_paper(Path(source_dir)):
         try:
             citing_id = None
             metadata_path = references_path.with_name("metadata.json")
@@ -404,6 +477,7 @@ def flatten_references_json(
             rows.append({
                 "citing_arxiv_id": citing_id,
                 "ref_arxiv_id": ref_id,
+                "ref_s2_id": reference.get("paperId"),
                 "title": reference.get("title"),
                 "authors": [
                     author.get("name") if isinstance(author, dict) else author
@@ -411,17 +485,46 @@ def flatten_references_json(
                     if author
                 ],
                 "year": reference.get("year"),
+                "publication_date": reference.get("publicationDate"),
+                "venue": reference.get("venue") or None,
             })
-    return pd.DataFrame(
-        rows,
-        columns=[
-            "citing_arxiv_id",
-            "ref_arxiv_id",
-            "title",
-            "authors",
-            "year",
-        ],
-    )
+    return pd.DataFrame(rows, columns=REFERENCE_COLUMNS)
+
+
+def build_references_table(references: pd.DataFrame) -> pd.DataFrame:
+    """Shape reference rows into the published ``references`` table.
+
+    Columns: arxiv_id (citing paper), ref_arxiv_id, ref_title, ref_authors,
+    ref_submission_date (publication date, else the year), ref_s2_id.
+    """
+    frame = references.copy()
+    if "citing_arxiv_id" not in frame.columns:
+        frame = clean_references_table(frame)
+    frame = frame[frame["ref_arxiv_id"].notna() & frame["citing_arxiv_id"].notna()]
+
+    def submission_date(row: pd.Series) -> Optional[str]:
+        date = row.get("publication_date")
+        if isinstance(date, str) and date.strip():
+            return date.strip()
+        year = clean_year(row.get("year"))
+        return str(year) if year else None
+
+    def author_list(value: object) -> List[str]:
+        if isinstance(value, (list, tuple)):
+            return [str(name) for name in value if name]
+        if value is None or (not isinstance(value, str) and pd.isna(value)):
+            return []
+        return [str(value)]
+
+    table = pd.DataFrame({
+        "arxiv_id": frame["citing_arxiv_id"].astype(str),
+        "ref_arxiv_id": frame["ref_arxiv_id"].astype(str),
+        "ref_title": frame.get("title", pd.Series([None] * len(frame), index=frame.index)),
+        "ref_authors": frame.get("authors", pd.Series([[]] * len(frame), index=frame.index)).map(author_list),
+        "ref_submission_date": frame.apply(submission_date, axis=1) if len(frame) else [],
+        "ref_s2_id": frame.get("ref_s2_id", pd.Series([None] * len(frame), index=frame.index)),
+    })
+    return table.drop_duplicates(subset=["arxiv_id", "ref_arxiv_id"]).reset_index(drop=True)
 
 
 def clean_references_table(frame: pd.DataFrame) -> pd.DataFrame:
@@ -619,6 +722,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         write_table(
             references_cleaned,
             args.output_dir / f"references_cleaned.{args.format}",
+            args.format,
+        )
+        # Published `references` table (arXiv-keyed references only)
+        write_table(
+            build_references_table(references_cleaned),
+            args.output_dir / f"references_table.{args.format}",
             args.format,
         )
     else:

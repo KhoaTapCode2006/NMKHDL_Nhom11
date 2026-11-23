@@ -118,7 +118,7 @@ class FeatureEngineeringTests(unittest.TestCase):
         references_df = pd.DataFrame([
             {
                 "citing_arxiv_id": "2411.00001",
-                "ref_arxiv_id": "1111.00001",
+                "ref_arxiv_id": "2111.00001",
                 "title": "Title 1",
             }
         ])
@@ -127,7 +127,7 @@ class FeatureEngineeringTests(unittest.TestCase):
             {
                 "arxiv_id": "2411.00001",
                 "citation_key": "entry_labeled",
-                "groundtruth_arxiv_id": "1111.00001",
+                "groundtruth_arxiv_id": "2111.00001",
             }
         ])
 
