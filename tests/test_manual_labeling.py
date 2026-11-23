@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -106,18 +108,40 @@ class ManualLabelingTests(unittest.TestCase):
             self.assertEqual(prep["publications_count"], 1)
             self.assertEqual(prep["entries_count"], 20)
 
-            stats = finalize_manual_labels(
-                review_csv_path=out_dir / "manual_review_sheet.csv",
+            sheet_path = out_dir / "manual_review_sheet.csv"
+            sheet = pd.read_csv(sheet_path, dtype=str).fillna("")
+            self.assertTrue({"prefilled_arxiv_id", "reviewed"} <= set(sheet.columns))
+            self.assertTrue((sheet["reviewed"] == "").all())
+
+            finalize_args = dict(
+                review_csv_path=sheet_path,
                 references_csv_path=out_dir / "references_cleaned.csv",
                 output_dir=out_dir,
                 min_publications=1,
                 min_entries_per_pub=20,
                 min_total_entries=20,
             )
+            # Pre-filled suggestions are not labels until a person reviews them
+            with self.assertRaises(ValueError), contextlib.redirect_stdout(io.StringIO()):
+                finalize_manual_labels(**finalize_args)
+
+            sheet["reviewed"] = "yes"
+            sheet.to_csv(sheet_path, index=False, encoding="utf-8-sig")
+            stats = finalize_manual_labels(**finalize_args)
             self.assertEqual(stats["total_manual_publications"], 1)
             self.assertEqual(stats["total_labeled_entries_Q"], 20)
             self.assertEqual(stats["total_positive_matches"], 1)
             self.assertEqual(stats["total_candidate_matrix_cells"], 40)
+            self.assertEqual(stats["review"]["reviewed_rows"], 20)
+            self.assertEqual(stats["review"]["suggestions_changed"], 0)
+
+            # The reviewer rejects the pre-filled match of ref_0
+            sheet.loc[sheet["citation_key"] == "ref_0", "groundtruth_arxiv_id"] = ""
+            sheet.to_csv(sheet_path, index=False, encoding="utf-8-sig")
+            stats = finalize_manual_labels(**finalize_args)
+            self.assertEqual(stats["total_positive_matches"], 0)
+            self.assertEqual(stats["review"]["suggestions_changed"], 1)
+            self.assertEqual(stats["review"]["removed_match"], 1)
 
 
 if __name__ == "__main__":

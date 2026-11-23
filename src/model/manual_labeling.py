@@ -398,12 +398,15 @@ def crawl_custom_range(
                     break
 
             if not all_versions_exist:
+                # Date of every version (one batched API call; none for single-version papers)
+                version_dates = arxiv_crawler.fetch_version_dates({base_id: paper}).get(base_id)
                 for version_number in range(1, int(latest_version) + 1):
                     arxiv_crawler.get_source(
                         f"{base_id}v{version_number}",
                         save_dir=out_dir,
                         paper=paper,
                         references=references,
+                        version_dates=version_dates,
                     )
             else:
                 print(f"  Skipped download for {base_id} (already downloaded)")
@@ -703,6 +706,7 @@ DATA.rows.forEach(r => {{
   if (key in savedOverrides) {{
     r.groundtruth_arxiv_id = savedOverrides[key];
     r.human_verified = true;
+    r.reviewed = "yes";
   }}
 }});
 
@@ -728,6 +732,7 @@ function setLabel(arxivId, citationKey, refArxivId) {{
   if (row) {{
     row.groundtruth_arxiv_id = refArxivId || "";
     row.human_verified = true;
+    row.reviewed = "yes";
   }}
   render();
 }}
@@ -736,8 +741,9 @@ function updateStats() {{
   const total = DATA.rows.length;
   const matched = DATA.rows.filter(r => r.groundtruth_arxiv_id && r.groundtruth_arxiv_id.trim() !== "").length;
   const needsCheck = DATA.rows.filter(r => r.review_status === "NEEDS_HUMAN_CHECK").length;
+  const reviewed = DATA.rows.filter(r => r.reviewed === "yes").length;
   document.getElementById("statsBar").textContent =
-    `Tổng số bài: ${{papers.length}} | Tổng số BibTeX entries: ${{total}} | Đang gán khớp (Positive): ${{matched}} | Không khớp (None): ${{total - matched}} | Cần chú ý kiểm tra: ${{needsCheck}}`;
+    `Tổng số bài: ${{papers.length}} | Tổng số BibTeX entries: ${{total}} | Đã duyệt: ${{reviewed}}/${{total}} | Đang gán khớp (Positive): ${{matched}} | Không khớp (None): ${{total - matched}} | Cần chú ý kiểm tra: ${{needsCheck}}`;
 }}
 
 function render() {{
@@ -769,7 +775,7 @@ function render() {{
       <div>
         <span class="badge ${{r.review_status}}">${{r.review_status}}</span>
         <strong>[${{r.arxiv_id}}]</strong> <code>${{r.citation_key}}</code>
-        ${{r.human_verified ? '<span class="badge AUTO_EXACT_ID">✓ Đã duyệt</span>' : ''}}
+        ${{(r.reviewed === "yes" || r.human_verified) ? '<span class="badge AUTO_EXACT_ID">✓ Đã duyệt</span>' : '<span class="badge NEEDS_HUMAN_CHECK">Chưa duyệt</span>'}}
       </div>
       <div class="title">${{r.bib_title || '<i>(Không có tiêu đề tách riêng)</i>'}}</div>
       <div class="meta">👤 <b>Authors:</b> ${{r.bib_authors || 'N/A'}} | 📅 <b>Year:</b> ${{r.bib_year || 'N/A'}}</div>
@@ -781,6 +787,7 @@ function render() {{
           onchange="setLabel('${{r.arxiv_id}}', '${{r.citation_key}}', this.value.trim())"
           style="width:170px; margin-left:6px; font-weight:bold; color:#4ade80;" />
         <button onclick="setLabel('${{r.arxiv_id}}', '${{r.citation_key}}', '')" style="margin-left:4px;">Xóa (None)</button>
+        <button onclick="setLabel('${{r.arxiv_id}}', '${{r.citation_key}}', '${{r.groundtruth_arxiv_id || ''}}')" style="margin-left:4px;">✓ Xác nhận nhãn này</button>
       </div>
     `;
 
@@ -1012,6 +1019,12 @@ def prepare_manual_review(
         key = (row["arxiv_id"], row["citation_key"])
         if key in VERIFIED_MANUAL_OVERRIDES:
             row["groundtruth_arxiv_id"] = VERIFIED_MANUAL_OVERRIDES[key]
+        # The pre-filled value is only a suggestion. Keep it apart so finalize can
+        # report how often the reviewer changed it, and start every row as not
+        # reviewed: a person must confirm or correct each label.
+        row["prefilled_arxiv_id"] = row["groundtruth_arxiv_id"]
+        row["reviewed"] = ""
+        row["reviewer_note"] = ""
 
     review_df = pd.DataFrame(review_rows)
     sheet_path = output_dir / "manual_review_sheet.csv"
@@ -1047,8 +1060,15 @@ def finalize_manual_labels(
     min_publications: int = 5,
     min_entries_per_pub: int = 20,
     min_total_entries: int = 100,
+    allow_unreviewed: bool = False,
 ) -> Dict[str, Any]:
-    """Validate reviewed manual labels and export entry-level labels + m x n binary candidate matrix."""
+    """Validate reviewed manual labels and export entry-level labels + m x n binary candidate matrix.
+
+    Every row must be marked ``reviewed`` (yes/y/1/true/x) by the person who
+    checked it; otherwise the labels would only be the pre-filled heuristic
+    suggestions. ``allow_unreviewed`` turns that error into a warning (for
+    tests or drafts only, never for the submitted ground truth).
+    """
     review_df = pd.read_csv(review_csv_path, dtype=str).fillna("")
     refs_df = pd.read_csv(references_csv_path, dtype=str).fillna("")
     output_dir = Path(output_dir).resolve()
@@ -1104,10 +1124,45 @@ def finalize_manual_labels(
                 f"which does NOT exist in crawled arXiv references of {pub_id}."
             )
 
+    # Every row must have been checked by a person
+    reviewed_values = {"yes", "y", "1", "true", "x", "co", "có"}
+    if "reviewed" in review_df.columns:
+        is_reviewed = review_df["reviewed"].str.strip().str.lower().isin(reviewed_values)
+    else:
+        is_reviewed = pd.Series(False, index=review_df.index)
+    unreviewed = int((~is_reviewed).sum())
+    if unreviewed:
+        message = (
+            f"{unreviewed}/{len(review_df)} rows are not marked reviewed=yes; "
+            "check them in manual_review_ui.html (or the CSV) before finalizing."
+        )
+        (warnings if allow_unreviewed else errors).append(message)
+
     if errors:
         for err in errors:
             print(f"[ERROR] {err}")
         raise ValueError(f"Manual label validation failed with {len(errors)} error(s).")
+
+    # How much the reviewer changed the pre-filled suggestions
+    if "prefilled_arxiv_id" in review_df.columns:
+        prefilled = review_df["prefilled_arxiv_id"].map(
+            lambda x: (normalize_arxiv_id(x) or "") if str(x).strip() else ""
+        )
+        changed = prefilled != review_df["groundtruth_arxiv_id"]
+        status_col = review_df.get("review_status", pd.Series("", index=review_df.index))
+        review_summary = {
+            "reviewed_rows": int(is_reviewed.sum()),
+            "suggestions_changed": int(changed.sum()),
+            "suggestions_changed_pct": round(float(changed.mean()) * 100, 2) if len(review_df) else 0.0,
+            "changed_by_status": {
+                str(status): int(changed[status_col == status].sum())
+                for status in sorted(status_col.unique())
+            },
+            "added_match": int((changed & (prefilled == "") & (review_df["groundtruth_arxiv_id"] != "")).sum()),
+            "removed_match": int((changed & (prefilled != "") & (review_df["groundtruth_arxiv_id"] == "")).sum()),
+        }
+    else:
+        review_summary = {"reviewed_rows": int(is_reviewed.sum())}
 
     for warn in warnings:
         print(f"[WARNING] {warn}")
@@ -1173,6 +1228,7 @@ def finalize_manual_labels(
         if len(labels_df)
         else 0.0,
         "total_candidate_matrix_cells": len(pairs_df),
+        "review": review_summary,
         "manual_publication_ids": [p["arxiv_id"] for p in per_paper_stats],
         "per_publication": per_paper_stats,
     }
@@ -1287,6 +1343,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_fin.add_argument("--min-publications", type=int, default=5)
     p_fin.add_argument("--min-entries-per-pub", type=int, default=20)
     p_fin.add_argument("--min-total-entries", type=int, default=100)
+    p_fin.add_argument(
+        "--allow-unreviewed",
+        action="store_true",
+        help="Only for drafts: accept rows not marked reviewed=yes (warning instead of error)",
+    )
 
     return parser
 
@@ -1361,6 +1422,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             min_publications=args.min_publications,
             min_entries_per_pub=args.min_entries_per_pub,
             min_total_entries=args.min_total_entries,
+            allow_unreviewed=args.allow_unreviewed,
         )
         return 0
 
