@@ -1,17 +1,38 @@
+# Environment
 .venv
 .env
 .vscode
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+
+# Crawled / parsed corpus (data never goes into the code repository)
 sourcesArxiv/
 sourcesOAI/
-.jpg
-.png
-.mp4
-.json
-.tex
-.bib
+src/sourcesArxiv/
+src/sourcesOAI/
+**/elements/
+**/bibtex/
+crawl_log.json
+
+# Source files and binaries that only belong to the corpus
+*.tex
+*.bib
+*.bbl
+*.jpg
+*.jpeg
+*.png
+*.pdf
+*.eps
+*.mp4
+*.tar
+*.tar.gz
+*.gz
+
+# Generated run outputs (labels, matrices, predictions, cleaned tables)
+dedup_summary_stats.json
+data/
+src/data/
 
 # MyST build outputs
 _build

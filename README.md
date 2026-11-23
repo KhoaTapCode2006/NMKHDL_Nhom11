@@ -1,84 +1,238 @@
 # NMKHDL_Nhom11
 
-## 5. Recommended processing workflow
+Course project on arXiv: crawling full-text LaTeX sources (Milestone 1), parsing
+them into a deduplicated hierarchy with unified BibTeX entries (Milestone 2),
+and matching references (Milestone 3).
 
-A clean and maintainable pipeline is as follows:
+## 1. Requirements
 
-1. Load the assigned arXiv IDs.
-2. Resolve each ID with the arXiv API to obtain the latest version and metadata.
-3. Determine the number of paper versions and download each versioned source archive.
-4. Filter the archive to keep only `.tex` and `.bib` files.
-5. Save the files in a versioned folder structure with metadata JSON output.
-6. Query Semantic Scholar once per base paper to retrieve the references.
-7. Store reference results in JSON or structured database tables.
-8. Validate the output directories and check for missing or empty source archives.
+- Python 3.10 or newer (the benchmark testbed is a CPU-only Google Colab instance)
+- Packages:
 
-This workflow is robust, easy to debug, and aligned with the course requirement of building a crawler that respects protocol rules while producing usable research data.
-
-
-## 6. Comparison of the two crawler strategies
-
-The project uses two complementary approaches: the arXiv crawler and the OAI-based crawler. They overlap in purpose but differ in how they access and harvest data.
-
-| Aspect | arXiv crawler | OAI-PMH crawler |
-| --- | --- | --- |
-| Primary use | Targeted paper discovery and versioned source download | Metadata harvesting and broader repository-style access |
-| Data source | `arxiv.py` + `export.arxiv.org` | `oaipmh.arxiv.org/oai` |
-| Query style | Direct ID or keyword lookup | Record harvesting with `ListRecords` and `GetRecord` |
-| Version handling | Explicitly downloads each version (`v1`, `v2`, `v3`) | Can harvest metadata at the record level and track revisions |
-| Source data | Downloads `.tar.gz` paper source archives | Can also be combined with source download logic |
-| Best use case | Known list of paper IDs | Large or date-based metadata collection |
-| Rate limits | API-based pacing and retries | OAI request throttling and pagination handling |
-| Complexity | Lower for targeted paper sets | Higher for scalable metadata harvesting |
-| Output | Paper metadata, version folders, references | Structured metadata records, identifiers, harvesting state |
-
-This table is a practical sample comparison. In practice, both crawler types can be used together to achieve precise control over a target set and broader repository visibility.
-
-## 7. Run the parsing pipeline
-
-Run the end-to-end pipeline against the publication folders. It gathers the
-compilation path, builds and normalizes per-version hierarchies, extracts and
-deduplicates references, rewrites citations, deduplicates elements across
-versions, and writes the outputs under each publication's `elements/` and
-`bibtex/` folders. Use `--no-clean-tex` to retain the original sources:
-
-```powershell
-python -m src.parser.pipeline --source-dir src\sourcesArxiv
+```bash
+pip install -r src/requirements.txt
 ```
 
-The other runner scripts are not needed for a normal end-to-end run.
-`run_parser.py` and `run_hierarchy.py` remain compatibility entry points for the
-same workflow. The normalizer and deduplication scripts are optional if you
-need to rerun only those stages on existing generated data:
+## 2. Configuration
 
-```powershell
-python src\run_normalizer.py --source-dir src\sourcesArxiv
-python src\run_dedup.py --source-dir src\sourcesArxiv
+**Semantic Scholar key (optional).** Create a `.env` file at the repository root:
+
+```text
+API_KEY=<your Semantic Scholar API key>
 ```
 
-`run_normalizer.py` normalizes existing version trees in place, while
-`run_dedup.py` updates the unified element, hierarchy, and BibTeX outputs.
+Without a key the crawler still works, using the shared unauthenticated pool with
+a slower pace (one request every 3.5 s instead of every 1.25 s).
 
-## 8. Clean Milestone 1 and Milestone 2 tables
+**Assigned ID ranges.** Each member crawls their own range. Copy
+`members.example.json` to `members.json` and fill in the real ranges:
 
-The Phase 1 cleaning CLI normalizes BibTeX/reference schemas, titles, authors,
-years, and arXiv IDs while preserving the original columns:
+```json
+{
+  "tan": {"year_month": "2510", "start": 10788, "end": 10807},
+  "hoang": {"year_month": "2510", "start": 10808, "end": 10827},
+  "kiet": {"ids": ["2510.10828", "2510.10829"]}
+}
+```
 
-```powershell
+Every script that takes IDs accepts `--member <name> --members-file <path>`, or
+explicit `--ids ...`, or `--year-month YYMM --start N --end M`.
+
+## 3. Milestone 1: crawl
+
+Run the commands from `src/`.
+
+```bash
+cd src
+# arXiv API discovery (recommended)
+python arxiv_crawler.py --member tan --members-file ../members.json --out sourcesArxiv
+# same range, OAI-PMH discovery
+python oai_crawler.py --member tan --members-file ../members.json --out sourcesOAI
+# OAI-PMH date-window harvest (repository-scale example, not needed for grading)
+python oai_crawler.py harvest --from 2025-10-01 --until 2025-10-02 --set cs:cs:CL --limit 50
+```
+
+What the arXiv crawler does:
+
+1. resolves the IDs with batched `id_list` API calls and reads the latest version `vN`;
+2. asks the API once more for the versioned IDs `v2..vN-1` (batched) to get the date of every version;
+3. downloads every version from `https://export.arxiv.org/src/<id>vK` (3 s pacing,
+   descriptive User-Agent) and extracts only `.tex` / `.bib` files, so figures never
+   reach the disk;
+4. fetches the references once per paper from Semantic Scholar
+   (`paperId, externalIds, title, authors, year, publicationDate, venue`).
+
+Output layout:
+
+```text
+sourcesArxiv/
+├── crawl_log.json                 # requested/resolved IDs, missing IDs, statuses
+└── 2510.10788/
+    ├── v1/
+    │   ├── metadata.json          # see below
+    │   ├── references.json        # every Semantic Scholar reference (with or without arXiv ID)
+    │   └── *.tex, *.bib           # original paths inside the archive are kept
+    └── v2/ ...
+```
+
+`metadata.json` holds the columns of the `papers` table plus crawl details:
+`arxiv_id` (versioned), `base_id`, `version`, `title`, `authors`, `submission_date`
+(v1), `version_date`, `revised_dates` (v2..vN), `venue` (journal reference),
+`source_status` (`downloaded`, `no_tex_or_bib` for PDF-only/non-TeX versions,
+`download_failed`), `source_format`, the byte sizes before/after removing figures,
+`references_status` (`success`, `not_indexed`, `failed`), `references_count` and
+`arxiv_references_count`.
+
+Interrupted runs resume: versions whose `metadata.json` says `downloaded` or
+`no_tex_or_bib` are skipped.
+
+### Crawler benchmark
+
+Measure each crawler in its own process so the second one does not inherit the
+memory of the first:
+
+```bash
+python benchmark.py --crawler arxiv --clean --member tan --members-file ../members.json
+python benchmark.py --crawler oai   --clean --member tan --members-file ../members.json
+```
+
+Results go to `benchmark_results.csv` (one row per crawler) and
+`benchmark_timeseries.csv` (RAM sampled every 0.5 s plus the time of every paper).
+Commit these files exactly as the script writes them, and record `du -sh <output>`
+next to them.
+
+## 4. Milestone 2: parse
+
+```bash
+python -m src.parser.pipeline --source-dir src/sourcesArxiv
+```
+
+Stages, per publication: multi-file gathering → hierarchy construction →
+cleanup and math normalization → reference extraction and deduplication →
+citation renaming → full-text deduplication across versions.
+
+Useful options:
+
+| Option | Effect |
+| --- | --- |
+| `--limit N` | process only the first N publications |
+| `--clean-tex` | delete the original `.tex` files afterwards (off by default: the Milestone 1 corpus stays usable for re-runs) |
+| `--trace-memory` | also measure peak heap with `tracemalloc` (slows the run; do not use for timing) |
+| `--report-md`, `--stats-json` | where to write the run summary |
+
+Version statuses in `elements/compilation_manifest.json`:
+
+- `success`: every included file was found;
+- `partial`: the root and the document body were found but an included `.tex`
+  file is missing; the version is parsed and the warning is recorded;
+- `empty_version`: the version has no TeX sources (PDF-only), kept as an empty record;
+- `failed`: no root file or no document body.
+
+`\input` targets that are never TeX sources (`.tikz`, `.pgf`, `.bbl`, data files)
+are skipped without affecting the status.
+
+Output per publication:
+
+```text
+2510.10788/
+├── elements/
+│   ├── elements.json / elements.parquet      # `elements` table, deduplicated across versions
+│   ├── hierarchy.json / hierarchy.parquet    # `hierarchy` table, one row per edge and version
+│   ├── hierarchy_tree_vN.json                # nested tree of each version
+│   ├── full_inlined_vN.tex                   # compilation path inlined into one file
+│   ├── compilation_manifest.json             # root, included files, orphans, status
+│   ├── raw_references.json                   # bibliography blocks set aside by the parser
+│   └── dedup_stats.json                      # counts before/after deduplication
+└── bibtex/
+    ├── bibtex.json / bibtex.csv / bibtex.parquet   # `bibtex` table
+    ├── bibtex.bib                                   # the same entries as BibTeX records
+    └── citation_key_mapping.json                    # per-version old key -> canonical key
+```
+
+BibTeX notes: `.bib` files are chosen from `\bibliography{...}` when present, and
+`.bib` entries that the version never cites are left out (counted as
+`uncited_bib_entries_dropped`). `\bibitem` entries are converted with regular
+expressions, including the `\bibinfo{field}{value}` form; text that cannot be
+split into fields is kept in the BibTeX `note` rather than guessed as a title.
+
+Stage-only runners, for re-running one step on existing outputs:
+
+```bash
+python src/run_normalizer.py --source-dir src/sourcesArxiv
+python src/run_dedup.py --source-dir src/sourcesArxiv --summary-json dedup_summary.json
+```
+
+## 5. Milestone 3: reference matching
+
+### End-to-end pipeline
+
+```bash
+python -m src.model.run_matching \
+  --source-dir src/sourcesArxiv \
+  --manual-labels data/manual_labeling/manual_labels.csv \
+  --members-file members.json --num-members 4 \
+  --output-dir data/matching
+```
+
+Steps: cleaning (`data_cleaning`) → automatic labels on a random pool of at
+least max(ceil(10%) of the non-manual publications, 2k), balanced across members
+(`auto_labeler`) → split with k manual + k auto publications in test and in valid
+→ candidate matrix with citation-context features from `elements/`
+(`feature_engineering`) → models, selection on valid, evaluation on test
+(`modeling`) → `predictions` table.
+
+Labels (internal format, `data/matching/labels.csv`): one row per labeled BibTeX
+entry with `arxiv_id`, `citation_key`, `groundtruth_arxiv_id` (empty when the
+entry has no true reference among the crawled references) and `label_source`
+(`manual` or `auto`).
+
+Modeling: ranking of the candidate references of each BibTeX entry with
+pointwise scorers: a title-similarity baseline, logistic regression, histogram
+gradient boosting and random forest (scikit-learn, no pretrained model).
+Post-processing (arXiv-ID override, one-to-one assignment) is kept only when it
+improves validation MRR. Selection uses the **manual** part of the validation
+set, since automatic labels come from the same similarities as the features.
+
+Metrics: `mrr@5` counts every labeled entry (entries without a true reference
+score 0, the literal reading of the statement); `mrr@5_matchable` counts only
+entries with a true reference. Both are reported for all, manual and auto entries.
+
+Outputs in `--output-dir`: `labels.csv`, `split.json`, `candidate_matrix.parquet`,
+`model_comparison.csv`, `feature_importance.csv` (permutation importance on
+test), `ablation.csv` (feature groups on valid), `metrics.json` (including the
+precision/recall of the automatic labels on the manual pool),
+`references_table.parquet` and `predictions.parquet`
+(`arxiv_id, partition, citation_key, groundtruth_arxiv_id, cand_1..cand_5`).
+
+### Cleaning only
+
+```bash
 python -m src.model.data_cleaning
 ```
 
-If the inputs are not under `data/bibtex`, `data/references`, or the crawler
-source folders, pass them explicitly:
+If the inputs are not under the default folders, pass them explicitly:
 
-```powershell
-python -m src.model.data_cleaning `
-  --bibtex "path\to\bibtex.csv" `
-  --references "path\to\references.json" `
-  --references-source-dir "src\sourcesArxiv" `
-  --output-dir "data\cleaned" `
-  --format csv
+```bash
+python -m src.model.data_cleaning \
+  --bibtex "path/to/bibtex.csv" \
+  --references "path/to/references.json" \
+  --references-source-dir "src/sourcesArxiv" \
+  --output-dir "data/cleaned" \
+  --format parquet
 ```
 
-Use `--format parquet` when a Parquet engine is installed. The command prints
-the discovered schemas, sample rows, null rates, and before/after row counts.
+## 6. Tests
+
+```bash
+pytest -q
+```
+
+## 7. Crawler comparison
+
+| Aspect | `arxiv_crawler.py` | `oai_crawler.py` |
+| --- | --- | --- |
+| Discovery | `arxiv.Search(id_list=...)`, 100 IDs per call | `GetRecord` per ID; `ListRecords` for harvests |
+| Version dates | one extra batched call on versioned IDs | included in `arXivRaw` |
+| Requests for 50 papers | 1–2 | 50 (3 s pacing each) |
+| Download, extraction, references | shared `crawler_common.py` | shared `crawler_common.py` |
+| Best for | a known list or range of IDs | date or category harvests |
