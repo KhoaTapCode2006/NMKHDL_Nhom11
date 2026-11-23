@@ -1,391 +1,335 @@
-import arxiv
-import json
-import gzip
-import io
-import tarfile
-import time
+"""arXiv crawler: discovery through the arXiv API, then source + references.
+
+For each assigned base ID the crawler
+
+1. resolves the paper with one ``id_list`` API call per batch of IDs and reads
+   the latest version ``vN`` from the returned identifier;
+2. asks the API once more for the versioned IDs ``v1..vN`` (batched) to get the
+   date of every version, which fills ``submission_date`` and ``revised_dates``;
+3. downloads every version from ``export.arxiv.org/src/<id>vK`` and keeps only
+   the ``.tex`` / ``.bib`` files;
+4. fetches the reference list once per paper from Semantic Scholar and stores a
+   copy beside every version.
+
+Output layout::
+
+    <out>/<base_id>/v<K>/{metadata.json, references.json, *.tex, *.bib}
+    <out>/crawl_log.json   (missing IDs, failed versions, reference status)
+
+Usage::
+
+    python arxiv_crawler.py --year-month 2510 --start 10788 --end 10807
+    python arxiv_crawler.py --member tan --members-file ../members.json
+    python arxiv_crawler.py --ids 2510.10788 2510.10790 --out sourcesArxiv
+"""
+
+from __future__ import annotations
+
+import argparse
 import re
-import os
-import requests
-from pathlib import Path, PurePosixPath
-import urllib.request
-from dotenv import load_dotenv
-import http.client
-import threading
-import zlib
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+import time  # noqa: F401  (patched by the tests through this module)
+import urllib.request  # noqa: F401  (patched by the tests through this module)
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
 
-load_dotenv()
-API_KEY = os.getenv("API_KEY")
-YEAR_MONTH = "2510"  
-START_SEQ = 10788
-END_SEQ = 10807
-REFERENCE_REQUEST_INTERVAL = 5.0
-REFERENCE_BACKOFF_BASE = 10.0
-REFERENCE_BACKOFF_MAX = 120.0
-REFERENCE_MAX_RETRIES = 10
-_reference_next_request_at = 0.0
-_reference_request_lock = threading.Lock()
+import arxiv
 
-all_target_ids = [f"{YEAR_MONTH}.{seq:05d}" for seq in range(START_SEQ, END_SEQ + 1)]
+try:
+    from . import crawler_common as common
+except ImportError:  # executed as a script from inside src/
+    import crawler_common as common
 
-def chunk_list(data, chunk_size=100):
-    for i in range(0, len(data), chunk_size):
-        yield data[i:i + chunk_size]
+# Re-exported for callers such as benchmark.py.
+chunk_list = common.chunk_list
+fetch_references = common.fetch_references
+get_paper_references = common.get_paper_references
+save_json_file = common.save_json
 
-client = arxiv.Client(
-    page_size=100,
-    delay_seconds=3.0,
-    num_retries=3
-)
+DISCOVERY_BATCH_SIZE = 100
+DEFAULT_OUTPUT_DIR = "./sourcesArxiv"
+
+client = arxiv.Client(page_size=100, delay_seconds=3.0, num_retries=3)
 
 
-def save_json_file(data: dict | list, file_path: Path):
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+# --------------------------------------------------------------------------- #
+# Discovery
+# --------------------------------------------------------------------------- #
+def _iso(value) -> Optional[str]:
+    return value.isoformat() if value else None
 
-def build_paper_metadata(paper, versioned_arxiv_id: str) -> dict:
+
+def latest_version_of(paper) -> Tuple[str, int]:
+    """(base_id, latest version) from the identifier the API returned."""
+    entry_id = getattr(paper, "entry_id", "") or ""
+    return common.split_version(entry_id.rsplit("/abs/", 1)[-1])
+
+
+def discover_papers(ids: List[str]) -> Tuple[Dict[str, object], List[str]]:
+    """Resolve base IDs with the arXiv API.
+
+    Returns ``(papers_by_base_id, missing_ids)``; an ID is missing when the API
+    returned no entry for it (withdrawn, mistyped or not yet public).
+    """
+    papers: Dict[str, object] = {}
+    for batch in chunk_list(ids, DISCOVERY_BATCH_SIZE):
+        search = arxiv.Search(id_list=batch, max_results=len(batch))
+        for paper in client.results(search):
+            base_id, _ = latest_version_of(paper)
+            papers[base_id] = paper
+    missing = [paper_id for paper_id in ids if paper_id not in papers]
+    for paper_id in missing:
+        print(f"[MISSING] {paper_id}: not returned by the arXiv API")
+    return papers, missing
+
+
+def fetch_version_dates(papers: Dict[str, object]) -> Dict[str, Dict[int, str]]:
+    """Date of every version, keyed by base ID then version number.
+
+    Querying ``id_list`` with versioned IDs returns one entry per version whose
+    ``updated`` field is the date of that version. Papers with a single version
+    need no extra request: their only date is ``published``.
+    """
+    dates: Dict[str, Dict[int, str]] = {}
+    versioned_ids: List[str] = []
+    for base_id, paper in papers.items():
+        _, latest = latest_version_of(paper)
+        dates[base_id] = {1: _iso(getattr(paper, "published", None))}
+        if latest > 1:
+            dates[base_id][latest] = _iso(getattr(paper, "updated", None))
+            versioned_ids.extend(f"{base_id}v{v}" for v in range(2, latest))
+
+    for batch in chunk_list(versioned_ids, DISCOVERY_BATCH_SIZE):
+        search = arxiv.Search(id_list=batch, max_results=len(batch))
+        try:
+            for entry in client.results(search):
+                base_id, version = latest_version_of(entry)
+                if base_id in dates:
+                    dates[base_id][version] = _iso(getattr(entry, "updated", None))
+        except Exception as exc:  # dates are metadata; never abort the crawl
+            print(f"[DATES] version-date lookup failed for a batch: {exc}")
+    return dates
+
+
+# --------------------------------------------------------------------------- #
+# Metadata
+# --------------------------------------------------------------------------- #
+def build_paper_metadata(
+    paper,
+    versioned_arxiv_id: str,
+    version_dates: Optional[Dict[int, str]] = None,
+) -> dict:
+    """Metadata of one version, following the columns of the ``papers`` table."""
+    base_id, version = common.split_version(versioned_arxiv_id)
+    version_dates = version_dates or {}
+    submission_date = version_dates.get(1) or _iso(getattr(paper, "published", None))
+    _, latest = latest_version_of(paper)
+    version_date = version_dates.get(version)
+    if version_date is None and version == 1:
+        version_date = submission_date
+    if version_date is None and version == latest:
+        version_date = _iso(getattr(paper, "updated", None))
+    revised_dates = [
+        version_dates[v] for v in sorted(version_dates) if v > 1 and version_dates[v]
+    ]
+    journal_ref = getattr(paper, "journal_ref", None)
+
     return {
         "arxiv_id": versioned_arxiv_id,
+        "base_id": base_id,
+        "version": str(version),
         "title": re.sub(r"\s+", " ", paper.title).strip(),
         "authors": [author.name for author in paper.authors],
-        "version": versioned_arxiv_id.rsplit("v", 1)[-1],
-        "submission_date": paper.published.isoformat() if paper.published else None,
-        "updated_date": paper.updated.isoformat() if paper.updated else None,
-        "journal_ref": paper.journal_ref,
-        "primary_category": paper.primary_category,
-        "categories": paper.categories
+        "submission_date": submission_date,
+        "version_date": version_date,
+        "updated_date": version_date,  # old name, still read by the M1 report notebook
+        "revised_dates": revised_dates,
+        "venue": journal_ref or None,
+        "journal_ref": journal_ref,
+        "doi": getattr(paper, "doi", None),
+        "primary_category": getattr(paper, "primary_category", None),
+        "categories": list(getattr(paper, "categories", []) or []),
     }
 
 
-def _wait_for_reference_request(minimum_delay: float = 0.0) -> None:
-    """Wait until the next request slot using a monotonic deadline."""
-    global _reference_next_request_at
-
-    with _reference_request_lock:
-        deadline = max(
-            _reference_next_request_at,
-            time.monotonic() + max(0.0, minimum_delay),
-        )
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(remaining)
-
-        _reference_next_request_at = time.monotonic() + REFERENCE_REQUEST_INTERVAL
-
-
-def _retry_after_seconds(response: requests.Response) -> float:
-    """Parse Retry-After as either seconds or an HTTP date."""
-    value = response.headers.get("Retry-After", "").strip()
-    if not value:
-        return 0.0
-
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        try:
-            retry_at = parsedate_to_datetime(value)
-        except (TypeError, ValueError, OverflowError):
-            return 0.0
-
-        if retry_at.tzinfo is None:
-            retry_at = retry_at.replace(tzinfo=timezone.utc)
-        return max(
-            0.0,
-            (retry_at - datetime.now(timezone.utc)).total_seconds(),
-        )
-
-
-def get_paper_references(arxiv_id: str) -> list[dict] | None:
-    if not API_KEY:
-        raise RuntimeError("API_KEY is missing. Set it in the .env file.")
-
-    base_id = re.sub(r"v\d+$", "", arxiv_id)
-    url = f"https://api.semanticscholar.org/graph/v1/paper/arXiv:{base_id}"
-    params = {
-        "fields": (
-            "references.paperId,references.externalIds,references.title,"
-            "references.authors,references.year"
-        )
-    }
-    headers = {"x-api-key": API_KEY}
-    retry_delay = 0.0
-
-    for attempt in range(REFERENCE_MAX_RETRIES):
-        _wait_for_reference_request(retry_delay)
-        try:
-            response = requests.get(url, params=params, headers=headers, timeout=30)
-        except requests.RequestException as exc:
-            if attempt + 1 == REFERENCE_MAX_RETRIES:
-                print(
-                    f"Skipping {arxiv_id} after repeated reference request errors: "
-                    f"{type(exc).__name__}."
-                )
-                return None
-
-            retry_delay = min(
-                REFERENCE_BACKOFF_BASE * (2**attempt),
-                REFERENCE_BACKOFF_MAX,
-            )
-            print(
-                f"Reference request error for {arxiv_id} "
-                f"({type(exc).__name__}); retrying in {retry_delay:.1f}s "
-                f"({attempt + 1}/{REFERENCE_MAX_RETRIES})."
-            )
-            continue
-
-        if response.status_code == 429 or response.status_code >= 500:
-            if attempt + 1 == REFERENCE_MAX_RETRIES:
-                print(f"Skipping {arxiv_id} after repeated HTTP {response.status_code}.")
-                return None
-
-            exponential_backoff = min(
-                REFERENCE_BACKOFF_BASE * (2**attempt),
-                REFERENCE_BACKOFF_MAX,
-            )
-            retry_delay = max(
-                exponential_backoff,
-                _retry_after_seconds(response),
-            )
-            print(
-                f"HTTP {response.status_code} for {arxiv_id}; "
-                f"retrying in {retry_delay:.1f}s "
-                f"({attempt + 1}/{REFERENCE_MAX_RETRIES})."
-            )
-            continue
-
-        response.raise_for_status()
-        return response.json().get("references") or []
-
-    return None
-
-
+# --------------------------------------------------------------------------- #
+# One version
+# --------------------------------------------------------------------------- #
 def get_source(
     arxiv_id: str,
-    save_dir: str | Path = "./sourcesArxiv",
+    save_dir: str | Path = DEFAULT_OUTPUT_DIR,
     paper=None,
-    references: list | None = None,
+    references: Optional[list] = None,
+    references_status: Optional[str] = None,
+    version_dates: Optional[Dict[int, str]] = None,
 ) -> dict:
     """Download one version and save only its TeX/Bib files and JSON metadata."""
-    base_id, separator, version = arxiv_id.rpartition("v")
-    if not separator or not version.isdigit():
-        base_id, version = arxiv_id, "1"
-        versioned_arxiv_id = f"{base_id}v{version}"
-    else:
-        versioned_arxiv_id = arxiv_id
+    base_id, version = common.split_version(arxiv_id)
+    versioned_arxiv_id = f"{base_id}v{version}"
 
     if paper is None:
-        paper = next(client.results(arxiv.Search(id_list=[base_id])))
+        paper = next(client.results(arxiv.Search(id_list=[base_id], max_results=1)))
 
-    paper_dir = Path(save_dir) / base_id.replace("/", "-")
+    paper_dir = Path(save_dir) / common.paper_folder_name(base_id)
     version_dir = paper_dir / f"v{version}"
     version_dir.mkdir(parents=True, exist_ok=True)
-
     metadata_path = version_dir / "metadata.json"
 
-    # Resume support: skip versions that were fully downloaded earlier
-    if metadata_path.exists():
-        try:
-            with open(metadata_path, "r", encoding="utf-8") as f:
-                saved_meta = json.load(f)
-            if saved_meta.get("source_status") in {"downloaded", "no_tex_or_bib"}:
-                print(f"  {versioned_arxiv_id}: skipped (da tai truoc do)")
-                return {
-                    "paper_dir": str(paper_dir),
-                    "version_dir": str(version_dir),
-                    "source_status": "skipped",
-                }
-        except (json.JSONDecodeError, OSError):
-            pass
+    if common.version_is_complete(version_dir):
+        print(f"  {versioned_arxiv_id}: skipped (already downloaded)")
+        return {
+            "paper_dir": str(paper_dir),
+            "version_dir": str(version_dir),
+            "source_status": "skipped",
+        }
 
-    metadata = build_paper_metadata(paper, versioned_arxiv_id)
+    metadata = build_paper_metadata(paper, versioned_arxiv_id, version_dates)
     metadata["source_status"] = "downloading"
-    save_json_file(metadata, metadata_path)
+    common.save_json(metadata, metadata_path)
     if references is not None:
-        save_json_file(references, version_dir / "references.json")
+        common.save_json(references, version_dir / "references.json")
 
-    request = urllib.request.Request(
-        f"https://export.arxiv.org/src/{versioned_arxiv_id}",
-        headers={"User-Agent": "NMKHDL-Nhom11 arXiv source crawler"},
+    download = common.download_source(versioned_arxiv_id)
+    files = (
+        common.extract_source_archive(download.data, version_dir)
+        if download.succeeded
+        else None
     )
-    archive_bytes = b""
-    download_succeeded = False
-    source_not_found = False
-    download_error = None
-    max_download_retries = 3
-    
-    for attempt in range(max_download_retries):
-        try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                archive_bytes = response.read()
-            download_succeeded = True
-            time.sleep(3)
-            break
-            
-        except http.client.IncompleteRead as e:
-            download_error = f"IncompleteRead: {e}"
-            print(f"Đứt kết nối giữa chừng (IncompleteRead) tải {versioned_arxiv_id}. Thử lại ({attempt + 1}/{max_download_retries})...")
-            time.sleep(3)
-            
-        except urllib.error.HTTPError as error:
-            if error.code == 404:
-                source_not_found = True
-                download_error = None
-                time.sleep(3)
-                break
-            elif error.code in (429, 500, 502, 503, 504):
-                download_error = f"HTTP {error.code}: {error.reason}"
-                print(f"Lỗi server {error.code} khi tải {versioned_arxiv_id}. Thử lại ({attempt + 1}/{max_download_retries})...")
-                time.sleep(5)
-            else:
-                download_error = f"HTTP {error.code}: {error.reason}"
-                break
-                
-        except Exception as e:
-            download_error = f"{type(e).__name__}: {e}"
-            print(f"Lỗi mạng ({type(e).__name__}) tải {versioned_arxiv_id}. Thử lại ({attempt + 1}/{max_download_retries})...")
-            time.sleep(3)
+    status, error = common.source_status(download, files)
 
-    tex_files = []
-    bib_files = []
-    total_uncompressed_bytes = 0
-    filtered_uncompressed_bytes = 0
-    raw_archive_bytes = len(archive_bytes) if archive_bytes else 0
-    archive_error = None
-    source_is_pdf = False
+    if references_status is None:
+        references_status = "success" if isinstance(references, list) else "failed"
+    metadata.update(
+        {
+            "source_status": status,
+            "source_format": files["source_format"] if files else None,
+            "raw_archive_bytes": len(download.data),
+            "total_uncompressed_bytes": files["total_uncompressed_bytes"] if files else 0,
+            "filtered_uncompressed_bytes": (
+                files["filtered_uncompressed_bytes"] if files else 0
+            ),
+            "tex_files": files["tex_files"] if files else [],
+            "bib_files": files["bib_files"] if files else [],
+            "references_status": references_status,
+            **common.reference_summary(references),
+        }
+    )
+    if error:
+        metadata["download_error"] = error
+    common.save_json(metadata, metadata_path)
 
-    if download_succeeded and not archive_bytes:
-        archive_error = "Source endpoint returned an empty response"
-    elif download_succeeded and archive_bytes:
-        source_is_pdf = archive_bytes.lstrip().startswith(b"%PDF-")
-        if source_is_pdf:
-            archive = None
-        else:
-            try:
-                archive = tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*")
-            except tarfile.ReadError:
-                archive = None
-
-        if source_is_pdf:
-            pass
-        elif archive is not None:
-            with archive:
-                for member in archive.getmembers():
-                    if member.isfile():
-                        total_uncompressed_bytes += member.size
-                    member_path = PurePosixPath(member.name)
-                    if (
-                        not member.isfile()
-                        or member_path.is_absolute()
-                        or ".." in member_path.parts
-                        or member_path.suffix.lower() not in {".tex", ".bib"}
-                    ):
-                        continue
-
-                    source_file = archive.extractfile(member)
-                    if source_file is None:
-                        continue
-
-                    content = source_file.read()
-                    filtered_uncompressed_bytes += len(content)
-                    output_path = version_dir.joinpath(*member_path.parts)
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    output_path.write_bytes(content)
-                    if member_path.suffix.lower() == ".tex":
-                        tex_files.append(str(output_path.relative_to(version_dir)))
-                    else:
-                        bib_files.append(str(output_path.relative_to(version_dir)))
-        else:
-            try:
-                data = gzip.decompress(archive_bytes)
-                total_uncompressed_bytes = len(data)
-                if rb"\documentclass" in data or rb"\begin{document}" in data:
-                    output_path = version_dir / "main.tex"
-                    output_path.write_bytes(data)
-                    tex_files.append("main.tex")
-                    filtered_uncompressed_bytes = len(data)
-                else:
-                    archive_error = "Downloaded archive is not a recognized TeX source"
-            except (OSError, EOFError, zlib.error) as error:
-                archive_error = f"Invalid source archive: {error}"
-
-    metadata["raw_archive_bytes"] = raw_archive_bytes
-    metadata["total_uncompressed_bytes"] = total_uncompressed_bytes
-    metadata["filtered_uncompressed_bytes"] = filtered_uncompressed_bytes
-    metadata["references_status"] = "success" if isinstance(references, list) else "failed"
-    metadata["references_count"] = len(references) if isinstance(references, list) else 0
-    if tex_files or bib_files:
-        metadata["source_status"] = "downloaded"
-    elif source_not_found:
-        metadata["source_status"] = "no_tex_or_bib"
-    elif source_is_pdf:
-        metadata["source_status"] = "no_tex_or_bib"
-    elif download_error or archive_error or not download_succeeded:
-        metadata["source_status"] = "download_failed"
-        metadata["download_error"] = download_error or archive_error or "Download failed"
-    else:
-        metadata["source_status"] = "no_tex_or_bib"
-    save_json_file(metadata, metadata_path)
     return {
         "paper_dir": str(paper_dir),
         "version_dir": str(version_dir),
-        "tex_files": tex_files,
-        "bib_files": bib_files,
-        "raw_archive_bytes": raw_archive_bytes,
-        "total_uncompressed_bytes": total_uncompressed_bytes,
-        "filtered_uncompressed_bytes": filtered_uncompressed_bytes,
-        "source_status": metadata["source_status"],
-        "error": metadata.get("download_error"),
+        "tex_files": metadata["tex_files"],
+        "bib_files": metadata["bib_files"],
+        "raw_archive_bytes": metadata["raw_archive_bytes"],
+        "total_uncompressed_bytes": metadata["total_uncompressed_bytes"],
+        "filtered_uncompressed_bytes": metadata["filtered_uncompressed_bytes"],
+        "source_status": status,
+        "error": error,
     }
 
 
-if __name__ == "__main__":
-    for batch in chunk_list(all_target_ids, chunk_size=50):
-        search = arxiv.Search(id_list=batch)
+# --------------------------------------------------------------------------- #
+# One paper / whole crawl
+# --------------------------------------------------------------------------- #
+def _load_saved_references(paper_dir: Path) -> Optional[list]:
+    saved = common.read_json(paper_dir / "v1" / "references.json")
+    return saved if isinstance(saved, list) else None
 
-        for paper in client.results(search):
-            latest = paper.entry_id.rsplit("/", 1)[-1]
-            base_id, _, latest_version = latest.rpartition("v")
-            print(f"[{base_id}] (Latest: v{latest_version})")
 
-            paper_dir = Path("./sourcesArxiv") / base_id.replace("/", "-")
-            all_versions_exist = True
-            for v_num in range(1, int(latest_version) + 1):
-                v_meta = paper_dir / f"v{v_num}" / "metadata.json"
-                if not v_meta.exists():
-                    all_versions_exist = False
-                    break
-                try:
-                    with open(v_meta, "r", encoding="utf-8") as f_m:
-                        if json.load(f_m).get("source_status") not in {"downloaded", "no_tex_or_bib"}:
-                            all_versions_exist = False
-                            break
-                except Exception:
-                    all_versions_exist = False
-                    break
+def crawl_paper(
+    paper,
+    save_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    with_refs: bool = True,
+    version_dates: Optional[Dict[int, str]] = None,
+) -> dict:
+    """Fetch references once, then download every version ``v1..vN``."""
+    base_id, latest = latest_version_of(paper)
+    paper_dir = Path(save_dir) / common.paper_folder_name(base_id)
+    print(f"[{base_id}] latest: v{latest}")
 
-            if all_versions_exist:
-                print(f"  Bo qua toan bo {base_id} (da tai du {latest_version} phien ban)")
-                continue
+    version_dirs = [paper_dir / f"v{v}" for v in range(1, latest + 1)]
+    if all(common.version_is_complete(d) for d in version_dirs):
+        print(f"  {base_id}: all {latest} versions already downloaded")
+        return {"base_id": base_id, "versions": latest, "results": [], "skipped": True}
 
-            ref_file = paper_dir / "v1" / "references.json"
-            references = None
-            if ref_file.exists():
-                try:
-                    with open(ref_file, "r", encoding="utf-8") as f_r:
-                        references = json.load(f_r)
-                except Exception:
-                    references = None
+    references, ref_status = _load_saved_references(paper_dir), "success"
+    if references is None and with_refs:
+        try:
+            references, ref_status = fetch_references(base_id)
+        except Exception as exc:  # one paper must never stop the crawl
+            print(f"[S2] {base_id}: {type(exc).__name__}: {exc}")
+            references, ref_status = None, "failed"
+    elif references is None:
+        ref_status = "skipped"
 
-            if references is None:
-                references = get_paper_references(base_id)
-
-            for version_number in range(1, int(latest_version) + 1):
+    results = []
+    for version in range(1, latest + 1):
+        try:
+            results.append(
                 get_source(
-                    f"{base_id}v{version_number}",
+                    f"{base_id}v{version}",
+                    save_dir=save_dir,
                     paper=paper,
                     references=references,
+                    references_status=ref_status,
+                    version_dates=version_dates,
                 )
+            )
+        except Exception as exc:
+            print(f"  {base_id}v{version}: ERROR {type(exc).__name__}: {exc}")
+            results.append({"source_status": "error", "error": str(exc)})
+    return {
+        "base_id": base_id,
+        "versions": latest,
+        "references_status": ref_status,
+        "results": results,
+        "skipped": False,
+    }
+
+
+def crawl(
+    ids: Iterable[str],
+    save_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    with_refs: bool = True,
+) -> dict:
+    """Crawl every base ID and write ``crawl_log.json`` next to the output."""
+    ids = list(dict.fromkeys(common.strip_version(i) for i in ids))
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    papers, missing = discover_papers(ids)
+    dates = fetch_version_dates(papers)
+
+    log = {"requested": len(ids), "resolved": len(papers), "missing_ids": missing, "papers": {}}
+    for base_id in ids:
+        if base_id not in papers:
+            continue
+        result = crawl_paper(papers[base_id], save_dir, with_refs, dates.get(base_id))
+        log["papers"][base_id] = {
+            "versions": result["versions"],
+            "references_status": result.get("references_status"),
+            "statuses": [r.get("source_status") for r in result["results"]],
+        }
+    common.save_json(log, save_dir / "crawl_log.json")
+    return log
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="arXiv API crawler (sources + references)")
+    common.add_id_arguments(parser)
+    parser.add_argument("--out", default=DEFAULT_OUTPUT_DIR, help="Output directory")
+    parser.add_argument("--no-refs", action="store_true", help="Skip Semantic Scholar")
+    args = parser.parse_args(argv)
+
+    log = crawl(common.resolve_ids(args), args.out, with_refs=not args.no_refs)
+    print(
+        f"Done: {log['resolved']}/{log['requested']} papers resolved, "
+        f"{len(log['missing_ids'])} missing. Log: {Path(args.out) / 'crawl_log.json'}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
