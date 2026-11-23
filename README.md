@@ -86,6 +86,18 @@ sourcesArxiv/
 Interrupted runs resume: versions whose `metadata.json` says `downloaded` or
 `no_tex_or_bib` are skipped.
 
+Request pacing (arXiv allows one request every 3 seconds and one connection at a time):
+
+- the 3 seconds are counted from the **start** of the previous arXiv request, so
+  the time spent downloading and unpacking an archive counts towards the wait; a
+  download that takes longer than 3 s is followed immediately by the next one;
+- requests to arXiv are never overlapped, and the API calls, the OAI-PMH calls
+  and the source downloads all share this one pacer;
+- Semantic Scholar is another server with its own limit (1 request per second
+  with a key), so the references of the next papers are fetched in a background
+  thread while sources download. Up to 25 results wait ahead of the crawl;
+- `metadata.json` records `download_seconds` of each version.
+
 ### Crawler benchmark
 
 Measure each crawler in its own process so the second one does not inherit the

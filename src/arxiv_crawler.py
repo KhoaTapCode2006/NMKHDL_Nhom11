@@ -202,6 +202,7 @@ def get_source(
         {
             "source_status": status,
             "source_format": files["source_format"] if files else None,
+            "download_seconds": round(download.seconds, 3),
             "raw_archive_bytes": len(download.data),
             "total_uncompressed_bytes": files["total_uncompressed_bytes"] if files else 0,
             "filtered_uncompressed_bytes": (
@@ -238,31 +239,91 @@ def _load_saved_references(paper_dir: Path) -> Optional[list]:
     return saved if isinstance(saved, list) else None
 
 
+def needs_references(paper, save_dir: str | Path = DEFAULT_OUTPUT_DIR) -> bool:
+    """True when crawling this paper will have to ask Semantic Scholar for references.
+
+    That includes a paper whose sources are all downloaded but whose references
+    are missing (they failed, or the run used ``--no-refs``): a re-run fills them in.
+    """
+    base_id, _latest = latest_version_of(paper)
+    paper_dir = Path(save_dir) / common.paper_folder_name(base_id)
+    return _load_saved_references(paper_dir) is None
+
+
+def attach_references(
+    paper_dir: Path, latest: int, references: list, status: str
+) -> None:
+    """Store late references in every version folder and update their metadata."""
+    summary = common.reference_summary(references)
+    for version in range(1, latest + 1):
+        version_dir = Path(paper_dir) / f"v{version}"
+        metadata_path = version_dir / "metadata.json"
+        metadata = common.read_json(metadata_path)
+        if not isinstance(metadata, dict):
+            continue
+        common.save_json(references, version_dir / "references.json")
+        metadata["references_status"] = status
+        metadata.update(summary)
+        common.save_json(metadata, metadata_path)
+
+
+def start_reference_prefetcher(
+    papers: Iterable,
+    save_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    with_refs: bool = True,
+    lookahead: int = 25,
+) -> Optional[common.ReferencePrefetcher]:
+    """Start fetching the references of the papers that need them, in crawl order."""
+    if not with_refs:
+        return None
+    ids = [latest_version_of(p)[0] for p in papers if needs_references(p, save_dir)]
+    return common.ReferencePrefetcher(ids, lookahead=lookahead).start() if ids else None
+
+
 def crawl_paper(
     paper,
     save_dir: str | Path = DEFAULT_OUTPUT_DIR,
     with_refs: bool = True,
     version_dates: Optional[Dict[int, str]] = None,
+    prefetcher: Optional[common.ReferencePrefetcher] = None,
 ) -> dict:
-    """Fetch references once, then download every version ``v1..vN``."""
+    """Fetch references once, then download every version ``v1..vN``.
+
+    With a ``prefetcher`` the references were requested in the background while
+    earlier papers were downloading; without one they are requested here.
+    """
     base_id, latest = latest_version_of(paper)
     paper_dir = Path(save_dir) / common.paper_folder_name(base_id)
     print(f"[{base_id}] latest: v{latest}")
 
     version_dirs = [paper_dir / f"v{v}" for v in range(1, latest + 1)]
-    if all(common.version_is_complete(d) for d in version_dirs):
+    sources_done = all(common.version_is_complete(d) for d in version_dirs)
+    references, ref_status = _load_saved_references(paper_dir), "success"
+    if sources_done and (references is not None or not with_refs):
         print(f"  {base_id}: all {latest} versions already downloaded")
         return {"base_id": base_id, "versions": latest, "results": [], "skipped": True}
 
-    references, ref_status = _load_saved_references(paper_dir), "success"
     if references is None and with_refs:
         try:
-            references, ref_status = fetch_references(base_id)
+            if prefetcher is not None and prefetcher.has(base_id):
+                references, ref_status = prefetcher.get(base_id)
+            else:
+                references, ref_status = fetch_references(base_id)
         except Exception as exc:  # one paper must never stop the crawl
             print(f"[S2] {base_id}: {type(exc).__name__}: {exc}")
             references, ref_status = None, "failed"
     elif references is None:
         ref_status = "skipped"
+
+    if sources_done:
+        # Only the references were missing: attach them, no source to download.
+        if references is not None:
+            attach_references(paper_dir, latest, references, ref_status)
+        print(f"  {base_id}: references {ref_status} (sources were already downloaded)")
+        return {
+            "base_id": base_id, "versions": latest, "references_status": ref_status,
+            "results": [], "skipped": False,
+        }
 
     results = []
     for version in range(1, latest + 1):
@@ -301,17 +362,26 @@ def crawl(
 
     papers, missing = discover_papers(ids)
     dates = fetch_version_dates(papers)
+    common.note_arxiv_request()  # the API client made the last arXiv request
 
     log = {"requested": len(ids), "resolved": len(papers), "missing_ids": missing, "papers": {}}
-    for base_id in ids:
-        if base_id not in papers:
-            continue
-        result = crawl_paper(papers[base_id], save_dir, with_refs, dates.get(base_id))
-        log["papers"][base_id] = {
-            "versions": result["versions"],
-            "references_status": result.get("references_status"),
-            "statuses": [r.get("source_status") for r in result["results"]],
-        }
+    ordered = [papers[i] for i in ids if i in papers]
+    prefetcher = start_reference_prefetcher(ordered, save_dir, with_refs)
+    try:
+        for base_id in ids:
+            if base_id not in papers:
+                continue
+            result = crawl_paper(
+                papers[base_id], save_dir, with_refs, dates.get(base_id), prefetcher
+            )
+            log["papers"][base_id] = {
+                "versions": result["versions"],
+                "references_status": result.get("references_status"),
+                "statuses": [r.get("source_status") for r in result["results"]],
+            }
+    finally:
+        if prefetcher is not None:
+            prefetcher.stop()
     common.save_json(log, save_dir / "crawl_log.json")
     return log
 

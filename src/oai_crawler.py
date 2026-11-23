@@ -54,9 +54,6 @@ MAX_RETRIES = 8
 BACKOFF_BASE = 3.0
 BACKOFF_MAX = 120.0
 
-_last_request_ts = 0.0
-
-
 class OAIError(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(f"OAI error [{code}]: {message}")
@@ -64,11 +61,9 @@ class OAIError(RuntimeError):
 
 
 def _throttle(min_delay: float = OAI_MIN_DELAY) -> None:
-    global _last_request_ts
-    wait = min_delay - (time.monotonic() - _last_request_ts)
-    if wait > 0:
-        time.sleep(wait)
-    _last_request_ts = time.monotonic()
+    """Share the arXiv pacer with the source downloads: 3 s from the start of the
+    previous request, whichever arXiv endpoint it went to."""
+    common.wait_for_arxiv_slot(min_delay)
 
 
 def backoff(attempt: int) -> float:

@@ -62,11 +62,13 @@ class DownloadResult:
 
     ``not_found`` means arXiv answered 404 (no source for this version), which
     is a legitimate empty record. ``error`` is set only for real failures.
+    ``seconds`` is the time the successful or final request took.
     """
 
     data: bytes = b""
     not_found: bool = False
     error: Optional[str] = None
+    seconds: float = 0.0
 
     @property
     def succeeded(self) -> bool:
@@ -95,6 +97,43 @@ def _retry_after_header(value: Optional[str]) -> float:
     return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
 
 
+# --------------------------------------------------------------------------- #
+# arXiv request pacing
+# --------------------------------------------------------------------------- #
+# arXiv asks for at most one request every 3 seconds and one connection at a
+# time. The 3 seconds are counted from the START of the previous request, so the
+# time spent downloading and unpacking an archive counts towards the wait
+# instead of being added to it. A request that takes longer than 3 seconds is
+# followed immediately by the next one. Requests are never overlapped: every
+# caller must finish one arXiv request before it starts the next (the
+# Semantic Scholar prefetcher talks to another server and does not use this).
+_arxiv_lock = threading.Lock()
+_arxiv_next_start = 0.0
+
+
+def wait_for_arxiv_slot(delay: float = SOURCE_REQUEST_DELAY) -> None:
+    """Block until a request to arXiv may start, and reserve the next slot."""
+    global _arxiv_next_start
+    with _arxiv_lock:
+        remaining = _arxiv_next_start - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        _arxiv_next_start = time.monotonic() + delay
+
+
+def note_arxiv_request(delay: float = SOURCE_REQUEST_DELAY) -> None:
+    """Record a request made elsewhere (the arxiv.py client) so the next one waits."""
+    global _arxiv_next_start
+    with _arxiv_lock:
+        _arxiv_next_start = max(_arxiv_next_start, time.monotonic() + delay)
+
+
+def reset_arxiv_pacer() -> None:
+    global _arxiv_next_start
+    with _arxiv_lock:
+        _arxiv_next_start = 0.0
+
+
 def download_source(
     versioned_id: str,
     retries: int = SOURCE_MAX_RETRIES,
@@ -107,21 +146,21 @@ def download_source(
     error: Optional[str] = None
     for attempt in range(retries):
         retry_after = 0.0
+        wait_for_arxiv_slot(delay)
+        started = time.monotonic()
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
                 data = response.read()
-            time.sleep(delay)
-            return DownloadResult(data=data)
+            return DownloadResult(data=data, seconds=time.monotonic() - started)
         except http.client.IncompleteRead as exc:
             error = f"IncompleteRead: {exc}"
         except urllib.error.HTTPError as exc:
+            elapsed = time.monotonic() - started
             if exc.code == 404:
-                time.sleep(delay)
-                return DownloadResult(not_found=True)
+                return DownloadResult(not_found=True, seconds=elapsed)
             error = f"HTTP {exc.code}: {exc.reason}"
             if exc.code not in RETRYABLE_HTTP_CODES:
-                time.sleep(delay)
-                return DownloadResult(error=error)
+                return DownloadResult(error=error, seconds=elapsed)
             headers = exc.headers or {}
             retry_after = _retry_after_header(headers.get("Retry-After"))
         except Exception as exc:  # timeouts, connection resets, DNS errors
@@ -396,15 +435,27 @@ API_KEY = os.getenv("API_KEY") or os.getenv("S2_API_KEY")
 # A key guarantees 1 request/s; the shared unauthenticated pool is far tighter.
 REFERENCE_REQUEST_INTERVAL = 1.25
 UNAUTHENTICATED_REQUEST_INTERVAL = 3.5
-REFERENCE_BACKOFF_BASE = 10.0
-REFERENCE_BACKOFF_MAX = 120.0
-REFERENCE_MAX_RETRIES = 10
+# Measured with a valid key at 0.8 requests/s: about two thirds of the requests
+# were answered 429, and slower pacing (2.5, 3.5, 5 s) did not help, so the
+# server is throttling at random under load rather than punishing our rate. A
+# short retry is as likely to succeed as a long wait, so the delay grows gently
+# (1.25 s, 1.9 s, 2.8 s, ... up to 30 s) and many attempts are allowed: with
+# 25 attempts a paper is lost only if every one of them is rejected.
+REFERENCE_BACKOFF_BASE = 1.25
+REFERENCE_BACKOFF_GROWTH = 1.5
+REFERENCE_BACKOFF_MAX = 30.0
+REFERENCE_MAX_RETRIES = 25
 _reference_next_request_at = 0.0
 _reference_request_lock = threading.Lock()
 
 
 def _reference_interval() -> float:
     return REFERENCE_REQUEST_INTERVAL if API_KEY else UNAUTHENTICATED_REQUEST_INTERVAL
+
+
+def _reference_backoff(attempt: int) -> float:
+    """Delay before retry number ``attempt + 1`` of a Semantic Scholar request."""
+    return min(REFERENCE_BACKOFF_BASE * (REFERENCE_BACKOFF_GROWTH ** attempt), REFERENCE_BACKOFF_MAX)
 
 
 def _wait_for_reference_request(minimum_delay: float = 0.0) -> None:
@@ -450,7 +501,7 @@ def fetch_references(arxiv_id: str) -> Tuple[Optional[list], str]:
             if attempt + 1 == REFERENCE_MAX_RETRIES:
                 print(f"[S2] {base_id}: giving up after {type(exc).__name__}")
                 return None, "failed"
-            retry_delay = _backoff(attempt, REFERENCE_BACKOFF_BASE, REFERENCE_BACKOFF_MAX)
+            retry_delay = _reference_backoff(attempt)
             print(
                 f"[S2] {base_id}: {type(exc).__name__}; retry in {retry_delay:.1f}s "
                 f"({attempt + 1}/{REFERENCE_MAX_RETRIES})"
@@ -465,7 +516,7 @@ def fetch_references(arxiv_id: str) -> Tuple[Optional[list], str]:
                 print(f"[S2] {base_id}: giving up after repeated HTTP {status_code}")
                 return None, "failed"
             retry_delay = max(
-                _backoff(attempt, REFERENCE_BACKOFF_BASE, REFERENCE_BACKOFF_MAX),
+                _reference_backoff(attempt),
                 _retry_after_seconds(response),
             )
             print(
@@ -504,3 +555,70 @@ def reference_summary(references: Optional[Iterable[dict]]) -> dict:
         and ref["externalIds"].get("ArXiv")
     )
     return {"references_count": len(references), "arxiv_references_count": with_arxiv}
+
+
+class ReferencePrefetcher:
+    """Fetch the Semantic Scholar references of upcoming papers in a background thread.
+
+    Semantic Scholar is another server with its own rate limit, so asking it for
+    the next papers while arXiv sources are being downloaded costs no arXiv
+    request and hides the reference time behind the 3-second arXiv pacing.
+    ``lookahead`` bounds how many results may wait unused, so the thread never
+    runs far ahead of the crawl.
+
+    Use ``has(id)`` to know whether an ID was queued, and ``get(id)`` to take its
+    ``(references, status)``; ``get`` blocks until that result is ready.
+    """
+
+    def __init__(
+        self,
+        ids: Iterable[str],
+        fetch=None,
+        lookahead: int = 25,
+    ) -> None:
+        self._ids = list(dict.fromkeys(ids))
+        self._queued = set(self._ids)
+        self._fetch = fetch or fetch_references
+        self._results: Dict[str, Tuple[Optional[list], str]] = {}
+        self._condition = threading.Condition()
+        self._slots = threading.Semaphore(max(1, lookahead))
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="reference-prefetcher", daemon=True
+        )
+
+    def start(self) -> "ReferencePrefetcher":
+        if self._ids:
+            self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        for paper_id in self._ids:
+            self._slots.acquire()
+            if self._stopped.is_set():
+                return
+            try:
+                result = self._fetch(paper_id)
+            except Exception as exc:  # one paper must not stop the others
+                print(f"[S2] {paper_id}: {type(exc).__name__}: {exc}")
+                result = (None, "failed")
+            with self._condition:
+                self._results[paper_id] = result
+                self._condition.notify_all()
+
+    def has(self, paper_id: str) -> bool:
+        return paper_id in self._queued
+
+    def get(self, paper_id: str) -> Tuple[Optional[list], str]:
+        with self._condition:
+            while paper_id not in self._results:
+                if not self._thread.is_alive():
+                    return None, "failed"  # the thread ended without this result
+                self._condition.wait(timeout=1.0)
+            result = self._results.pop(paper_id)
+        self._slots.release()
+        return result
+
+    def stop(self) -> None:
+        self._stopped.set()
+        self._slots.release()  # wake a thread waiting for a free slot

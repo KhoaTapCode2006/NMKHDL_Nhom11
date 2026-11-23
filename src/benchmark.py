@@ -216,6 +216,10 @@ def benchmark_arxiv_crawler(
     discovery_time_sec = time.perf_counter() - t_disc0
     papers = [papers_by_id[i] for i in target_ids if i in papers_by_id]
     per_item_disc_sec = discovery_time_sec / max(1, len(papers))
+    crawler_common.note_arxiv_request()  # the API client made the last arXiv request
+    # Same path as the real crawler: references of upcoming papers are fetched in
+    # the background, so a paper's time no longer includes waiting for them.
+    prefetcher = arxiv_crawler.start_reference_prefetcher(papers, save_dir, with_refs)
 
     # 2) Full processing time of each paper (references + every version).
     for paper_idx, paper in enumerate(papers, start=1):
@@ -227,6 +231,7 @@ def benchmark_arxiv_crawler(
             save_dir=save_dir,
             with_refs=with_refs,
             version_dates=version_dates.get(base_id),
+            prefetcher=prefetcher,
         )
         paper_elapsed = time.perf_counter() - t_paper0
         per_paper_times_sec.append(paper_elapsed)
@@ -245,6 +250,8 @@ def benchmark_arxiv_crawler(
             "discovery_time_sec": round(per_item_disc_sec, 3),
         })
 
+    if prefetcher is not None:
+        prefetcher.stop()
     total_wall_time_sec = time.perf_counter() - wall_start
     peak_ram_mb, avg_ram_mb, baseline_ram_mb = monitor.stop(crawler_name)
     storage_stats = compute_storage_footprint(save_dir)
@@ -289,7 +296,7 @@ def benchmark_oai_crawler(
     _prepare_directory(save_dir, clean=clean)
 
     # Reset bộ đếm throttle của OAI trước khi chạy
-    oai_crawler._last_request_ts = 0.0
+    crawler_common.reset_arxiv_pacer()
 
     monitor = MemoryMonitor(interval_sec=RAM_SAMPLE_INTERVAL_SEC)
     paper_events: list[dict] = []
