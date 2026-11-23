@@ -108,6 +108,27 @@ class MetricTests(unittest.TestCase):
         self.assertIsNone(table[table["citation_key"] == "unlabeled"].iloc[0]["groundtruth_arxiv_id"])
 
 
+class LabelFileTests(unittest.TestCase):
+    def test_manual_label_csv_keeps_ids_ending_in_zero(self):
+        from src.model.data_cleaning import read_table
+        from src.model.modeling import normalize_labels
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manual_labels.csv"
+            pd.DataFrame({
+                "arxiv_id": ["2407.17850", "2411.13800"],
+                "citation_key": ["a", "b"],
+                "groundtruth_arxiv_id": ["2203.15550", None],
+                "is_positive": [1, 0],
+                "label_source": "manual",
+            }).to_csv(path, index=False, encoding="utf-8-sig")
+            labels = normalize_labels(read_table(path))
+
+        self.assertEqual(list(labels["arxiv_id"]), ["2407.17850", "2411.13800"])
+        self.assertEqual(labels["groundtruth_arxiv_id"].iloc[0], "2203.15550")
+        self.assertIsNone(labels["groundtruth_arxiv_id"].iloc[1])
+
+
 class ModelingTests(unittest.TestCase):
     def test_trained_model_ranks_true_references_first(self):
         bib, refs, truth = synthetic_corpus()

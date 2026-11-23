@@ -279,15 +279,25 @@ def find_column(
     return None
 
 
+# Identifier columns must stay text: read as numbers, "2407.17850" would become
+# 2407.1785 and no longer match the publication or reference it names.
+ID_COLUMNS = (
+    "arxiv_id", "citing_arxiv_id", "ref_arxiv_id", "groundtruth_arxiv_id",
+    "candidate_ref_id", "extracted_arxiv_id", "suggested_arxiv_id",
+    "prefilled_arxiv_id", "citation_key", "eprint", "ref_s2_id",
+    "cand_1", "cand_2", "cand_3", "cand_4", "cand_5",
+)
+
+
 def read_table(path: Path) -> pd.DataFrame:
     """Read CSV, JSON/JSONL, or Parquet according to file suffix."""
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        return pd.read_csv(path)
+        return pd.read_csv(path, dtype={column: str for column in ID_COLUMNS})
     if suffix in {".json", ".jsonl"}:
         if suffix == ".jsonl":
-            return pd.read_json(path, lines=True)
+            return pd.read_json(path, lines=True, dtype=False)
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, list):
             return pd.DataFrame(data)

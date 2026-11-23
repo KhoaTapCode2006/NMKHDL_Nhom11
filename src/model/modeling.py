@@ -92,7 +92,8 @@ def normalize_labels(labels: pd.DataFrame, default_source: str = "manual") -> pd
             return None
         return normalize_arxiv_id(value)
 
-    frame["groundtruth_arxiv_id"] = frame["groundtruth_arxiv_id"].map(norm)
+    truth = frame["groundtruth_arxiv_id"].map(norm).astype(object)
+    frame["groundtruth_arxiv_id"] = truth.where(truth.notna(), None)
     frame = frame.drop_duplicates(subset=KEY, keep="first")
     return frame[KEY + ["groundtruth_arxiv_id", "label_source"]].reset_index(drop=True)
 

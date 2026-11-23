@@ -386,7 +386,7 @@ def save_benchmark_outputs(
     new_ts_df = pd.DataFrame(timeseries)
     if timeseries_csv.exists() and not new_ts_df.empty:
         try:
-            old_ts_df = pd.read_csv(timeseries_csv)
+            old_ts_df = pd.read_csv(timeseries_csv, dtype={"paper_id": str})
             old_ts_df = old_ts_df[~old_ts_df["crawler"].isin(new_ts_df["crawler"])]
             new_ts_df = pd.concat([old_ts_df, new_ts_df], ignore_index=True)
         except Exception:
