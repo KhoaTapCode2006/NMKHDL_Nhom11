@@ -221,6 +221,38 @@ python -m src.model.data_cleaning \
   --format parquet
 ```
 
+### Manual labeling
+
+The manual ground truth covers 20 publications, 5 from each assigned ID range,
+with every BibTeX entry of each publication labeled (at least 20 entries per
+publication, at least 400 in total):
+
+```bash
+python -m src.model.manual_labeling crawl-team20 --out sourcesManual20
+python -m src.model.manual_labeling prepare --source-dir sourcesManual20 --output-dir data/manual_labeling
+# review every row in manual_review_ui.html (or the CSV), then:
+python -m src.model.manual_labeling finalize \
+  --review-csv data/manual_labeling/manual_review_sheet.csv \
+  --references-csv data/manual_labeling/references_cleaned.csv \
+  --output-dir data/manual_labeling \
+  --min-publications 20 --min-entries-per-pub 20 --min-total-entries 400
+```
+
+`prepare` ranks the candidate references of every entry and pre-fills a
+suggestion; a person then checks each row, sets `groundtruth_arxiv_id` (empty
+when no crawled reference matches) and marks the row `reviewed = yes`.
+`finalize` refuses rows that were not reviewed and reports how many suggestions
+the reviewer changed (`manual_labeling_stats.json`).
+
+Label schema under `data/manual_labeling/`:
+- `manual_labels.csv` / `manual_labels.json`: one row per labeled BibTeX entry
+  with `arxiv_id`, `citation_key`, `groundtruth_arxiv_id` (matched
+  `ref_arxiv_id`, or empty when unmatched), `is_positive` (1 or 0) and
+  `label_source` (`manual`). This file is the `--manual-labels` input of
+  `run_matching`.
+- `manual_candidate_pairs.csv`: the within-publication m × n binary candidate
+  matrix with `arxiv_id`, `citation_key`, `ref_arxiv_id`, `label`, `label_source`.
+
 ## 6. Tests
 
 ```bash
