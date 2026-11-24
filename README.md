@@ -216,6 +216,51 @@ precision/recall of the automatic labels on the manual pool),
 `references_table.parquet` and `predictions.parquet`
 (`arxiv_id, partition, citation_key, groundtruth_arxiv_id, cand_1..cand_5`).
 
+### One-command Milestones 1–3 pipeline and Hugging Face tables
+
+The top-level command runs crawling, parsing, and matching sequentially. It
+exports each milestone's tables as soon as that stage completes, and writes the
+dataset card only after all three stages succeed. A finalized manual-label file
+is required by matching:
+
+```bash
+python -m src.milestone_pipeline \
+  --member tan --members-file members.json \
+  --manual-labels data/manual_labeling/manual_labels.csv \
+  --source-dir data/pipeline/sources \
+  --work-dir data/pipeline/work \
+  --dataset-dir data/huggingface_dataset \
+  --num-members 4
+```
+
+Instead of `--member`, select the crawl set with `--ids ID...` or with
+`--year-month YYMM --start N --end M`. When using explicit IDs or a numeric
+range, `--members-file` is optional (but recommended if auto-label selection
+should be balanced across members). Matching options such as `--auto-ratio`,
+`--seed`, and `--no-ablation` are also accepted. TeX files are kept unless
+`--clean-tex` is specified.
+
+The dataset output follows the Hub's config-per-table layout:
+
+```text
+data/huggingface_dataset/
+├── README.md
+└── data/
+    ├── papers/papers.parquet
+    ├── references/references.parquet
+    ├── elements/elements.parquet
+    ├── hierarchy/hierarchy.parquet
+    ├── bibtex/bibtex.parquet
+    └── predictions/predictions.parquet
+```
+
+`papers` and arXiv-keyed `references` are written after crawling;
+`elements`, `hierarchy`, and `bibtex` after parsing; `predictions` after
+matching. The crawl corpus and matching diagnostics remain under `--source-dir`
+and `--work-dir`. These output locations are ignored by Git; use a clean source
+directory for a new crawl because completed crawler versions are intentionally
+skipped on reruns.
+
 ### Cleaning only
 
 ```bash
