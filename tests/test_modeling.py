@@ -149,6 +149,11 @@ class ModelingTests(unittest.TestCase):
         self.assertIn("auto", results.test_metrics)
         self.assertTrue({"model", "postprocessing", "valid_manual_mrr@5_matchable"}
                         <= set(results.comparison.columns))
+        self.assertAlmostEqual(
+            results.valid_metrics["manual"]["mrr@5_matchable"],
+            float(results.comparison.iloc[0]["valid_manual_mrr@5_matchable"]),
+            places=6,
+        )
 
 
 class HoangFixTests(unittest.TestCase):
