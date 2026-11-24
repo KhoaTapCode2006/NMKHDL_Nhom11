@@ -9,8 +9,10 @@ __pycache__/
 # Crawled / parsed corpus (data never goes into the code repository)
 sourcesArxiv/
 sourcesOAI/
+sourcesManual20/
 src/sourcesArxiv/
 src/sourcesOAI/
+src/sourcesManual20/
 **/elements/
 **/bibtex/
 crawl_log.json
