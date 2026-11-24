@@ -1,0 +1,24 @@
+# Python >= 3.10
+# Install with: pip install -r src/requirements.txt
+
+# Milestone 1: crawling
+arxiv>=2.1,<5            # arXiv API client (client.results(search) style)
+requests>=2.31           # Semantic Scholar and OAI-PMH requests
+python-dotenv>=1.0       # reads API_KEY from .env (optional)
+
+# Benchmarks
+psutil>=5.9              # RSS sampling
+numpy>=1.26
+
+# Milestone 2: tables
+pandas>=2.1
+pyarrow>=14              # Parquet export
+
+# Milestone 3: string similarity (falls back to difflib when missing) and models
+rapidfuzz>=3.0
+scikit-learn>=1.2        # logistic regression, gradient boosting, random forest
+scipy>=1.10              # one-to-one assignment post-processing
+
+# Report figures and tests
+matplotlib>=3.8
+pytest>=8

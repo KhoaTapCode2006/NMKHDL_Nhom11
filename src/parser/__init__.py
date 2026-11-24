@@ -4,16 +4,18 @@ Phát triển bởi Nhóm 11 - Nhập môn Khoa học Dữ liệu.
 """
 
 from .gatherer import MultiFileGatherer
-from .extractor import HierarchyExtractor
 from .hierarchy_builder import HierarchyBuilder
-from .dedup import ElementDeduplicator
+from .hierarchy_normalizer import HierarchyNormalizer
+from .dedup import ElementDeduplicator, PublicationDeduplicator, ReferenceDeduplicator
 from .benchmark import ParserBenchmark
 
 __all__ = [
     "MultiFileGatherer",
-    "HierarchyExtractor",
     "HierarchyBuilder",
+    "HierarchyNormalizer",
     "ElementDeduplicator",
+    "PublicationDeduplicator",
+    "ReferenceDeduplicator",
     "ParserBenchmark",
     "ParsingPipeline",
 ]

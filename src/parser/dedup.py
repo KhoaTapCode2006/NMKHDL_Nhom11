@@ -1,30 +1,50 @@
 """
-Module Khử Trùng Lặp (Deduplication - Phần của Kiệt) cho Milestone 2.
-Thực hiện khử trùng lặp ở 2 cấp độ xuyên suốt các version của từng publication:
-1. Reference Entries (BibTeX Deduplication):
-   - Phát hiện các mục tài liệu tham khảo trùng lặp trong cùng version hoặc xuyên version
-     (bằng DOI chuẩn hóa, Title chuẩn hóa + kiểm tra tác giả/năm, hoặc Citation Key).
-   - Chọn 1 citation_key đại diện (canonical key) và hợp nhất (union) toàn bộ các trường
-     (entry_type, title, authors, year, doi, journal, url) để không mất thông tin.
-   - Đổi tên mọi lệnh trích dẫn \\cite{...} (và các biến thể \\citep, \\citet...) trong
-     nội dung các elements sang citation_key đại diện trước khi khử trùng lặp Full-text.
-2. Full-text Content (Elements & Hierarchy Deduplication):
-   - Khử trùng lặp các phần tử văn bản (elements) sau khi đã làm sạch và đồng bộ \\cite.
-   - Bảo toàn cấu trúc cây phân cấp (không gộp nhầm các khối itemize khác nội dung hoặc
-     các tiêu đề trùng tên trong cùng 1 version; mỗi version giữ nút gốc #root riêng).
-   - Ánh xạ lại bảng cạnh hierarchy và cập nhật trực tiếp vào cây hierarchy_tree.json
-     của từng version (trong phần của Tân) cũng như thư mục bibtex/ (trong phần của Khoa).
+Deduplication module for Milestone 2.
+
+Deduplicates at two levels, across every version of a publication:
+
+1. Reference entries (BibTeX):
+   - finds duplicate references inside one version or across versions (normalized
+     DOI, normalized title checked against authors/year, or citation key);
+   - keeps one canonical citation key and unions every field (entry_type, title,
+     authors, year, doi, journal, url) so that no information is lost;
+   - renames the keys of every \\cite{...} command (and \\citep, \\citet, ...) in the
+     elements of each version, using a per-version key mapping, before the
+     full-text deduplication.
+2. Full-text content (elements and hierarchy):
+   - deduplicates the elements after cleanup and citation renaming;
+   - preserves the tree: different lists, or repeated headings/sentences inside
+     one version, are not merged; each version keeps its own #root node;
+   - remaps the hierarchy edges and rewrites the per-version trees.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .hierarchy_builder import HierarchyBuilder
 from .hierarchy_normalizer import HierarchyNormalizer
+
+logger = logging.getLogger(__name__)
+
+# Every citation command, including custom ones such as \citealtt or \mycite;
+# used to know which .bib entries a version actually cites.
+ANY_CITE_COMMAND = re.compile(
+    r"\\[A-Za-z]*cite[A-Za-z]*\*?(?:\s*\[[^\]]*\])*\s*\{([^}]*)\}"
+)
+
+
+def cited_keys(texts: List[str]) -> Set[str]:
+    """Citation keys used by ``\\cite``-like commands in the given texts."""
+    keys: Set[str] = set()
+    for text in texts:
+        for match in ANY_CITE_COMMAND.finditer(text or ""):
+            keys.update(k.strip() for k in match.group(1).split(",") if k.strip())
+    return keys
 
 
 class ReferenceDeduplicator:
@@ -357,7 +377,7 @@ class ReferenceDeduplicator:
         cls, bibitems: List[str], arxiv_id: str, version: str = "v1"
     ) -> List[Dict[str, Any]]:
         """
-        Trích xuất các mục \\bibitem từ file .tex (hoặc raw_references.json của Tân)
+        Trích xuất các mục \\bibitem từ file .tex (hoặc từ raw_references.json)
         sang cấu trúc BibTeX chuẩn bằng biểu thức chính quy (Regular Expressions).
         """
         entries: List[Dict[str, Any]] = []
@@ -402,12 +422,27 @@ class ReferenceDeduplicator:
                 flags=re.IGNORECASE,
             ).strip(" .,;")
 
-            # Tách theo \newblock hoặc theo cấu trúc câu/in nghiêng (\emph, \textit, {\em ...})
+            # Tách theo \bibinfo, \newblock hoặc theo cấu trúc câu/in nghiêng (\emph, \textit, {\em ...})
             title = ""
             journal = ""
             authors_raw = ""
+            bibinfo = cls._extract_bibinfo_fields(content)
 
-            if "\\newblock" in content_no_doi:
+            if bibinfo:
+                # revtex/natbib style: \bibinfo{author}{...} \bibinfo{title}{...}
+                authors_raw = " and ".join(bibinfo.get("author", []) + bibinfo.get("person", []))
+                title = (bibinfo.get("title") or [""])[0]
+                journal = (
+                    bibinfo.get("journal") or bibinfo.get("booktitle")
+                    or bibinfo.get("series") or [""]
+                )[0]
+                if bibinfo.get("doi"):
+                    doi = cls.normalize_doi(bibinfo["doi"][0])
+                if bibinfo.get("url") and not url:
+                    url = bibinfo["url"][0].strip()
+                if bibinfo.get("year"):
+                    year = cls.parse_year_int(bibinfo["year"][0]) or year
+            elif "\\newblock" in content_no_doi:
                 blocks = [b.strip(" .,;") for b in content_no_doi.split("\\newblock") if b.strip()]
                 if len(blocks) >= 1:
                     authors_raw = blocks[0]
@@ -464,10 +499,18 @@ class ReferenceDeduplicator:
                             and year is not None
                             and cls.parse_year_int(journal_parts[-1]) == year
                         ):
-                            journal_parts.pop()
+                            # Bỏ năm ở cuối ("Journal of Tests, 2021." -> "Journal of
+                            # Tests"); chỉ bỏ cả phần khi nó chỉ gồm năm.
+                            stripped = re.sub(
+                                rf"[\s,;(]*\b{year}[a-z]?\)?[\s.]*$", "", journal_parts[-1]
+                            ).strip(" .,;")
+                            if stripped:
+                                journal_parts[-1] = stripped
+                            else:
+                                journal_parts.pop()
                         journal = ". ".join(journal_parts)
-                    elif len(parts) == 1:
-                        title = parts[0]
+                    # A single unstructured chunk is not split into fields: the
+                    # text stays in "raw" instead of being guessed as a title.
 
             clean_title = cls.clean_display_title(cls.strip_latex_accents_and_braces(title))
             clean_journal = cls.clean_display_title(cls.strip_latex_accents_and_braces(journal))
@@ -497,15 +540,89 @@ class ReferenceDeduplicator:
                 "doi": doi,
                 "journal": clean_journal,
                 "url": url,
+                "raw": content,
+                "_source": "bibitem",
             })
 
         return entries
 
     @classmethod
+    def select_bib_files(
+        cls, bib_files: List[Path], bibliography_commands: List[str], version_dir: Path
+    ) -> List[Path]:
+        """The .bib files named by ``\\bibliography{a,b}``; empty when none match."""
+        wanted: Set[str] = set()
+        for command in bibliography_commands or []:
+            if command.startswith("\\bibliographystyle"):
+                continue
+            match = re.search(r"\{([^{}]*)\}", command)
+            if not match:
+                continue
+            for name in match.group(1).split(","):
+                name = name.strip().replace("\\", "/")
+                if name.lower().endswith(".bib"):
+                    name = name[:-4]
+                if name:
+                    wanted.add(name.lower())
+        if not wanted:
+            return []
+        selected = []
+        for path in bib_files:
+            try:
+                relative = path.relative_to(version_dir).with_suffix("").as_posix().lower()
+            except ValueError:
+                relative = path.stem.lower()
+            if relative in wanted or path.stem.lower() in {Path(w).name for w in wanted}:
+                selected.append(path)
+        return selected
+
+    BIBINFO_RE = re.compile(r"\\bibinfo\s*\{\s*([A-Za-z]+)\s*\}\s*\{")
+
+    @classmethod
+    def _extract_bibinfo_fields(cls, content: str) -> Dict[str, List[str]]:
+        """Collect ``\\bibinfo{field}{value}`` pairs (nested braces allowed)."""
+        fields: Dict[str, List[str]] = {}
+        for match in cls.BIBINFO_RE.finditer(content):
+            value, _end = cls._extract_balanced_value(content, match.end() - 1)
+            value = re.sub(r"\s+", " ", value).strip()
+            if value:
+                fields.setdefault(match.group(1).lower(), []).append(value)
+        return fields
+
+    # Only characters that break BibTeX outside math; $ and _ stay as written
+    BIBTEX_SPECIAL_CHARS = re.compile(r"(?<!\\)([&%#])")
+
+    @classmethod
+    def entry_to_bibtex(cls, entry: Dict[str, Any]) -> str:
+        """Serialize one entry as a BibTeX record.
+
+        Unparsed ``\\bibitem`` text is kept in ``note`` when no title could be
+        extracted, so nothing is lost and no field is invented.
+        """
+        def escape(value: str) -> str:
+            return cls.BIBTEX_SPECIAL_CHARS.sub(r"\\\1", str(value))
+
+        key = re.sub(r"[\s,{}]", "_", str(entry.get("citation_key") or "unknown"))
+        lines = [f"@{entry.get('entry_type') or 'misc'}{{{key},"]
+        authors = entry.get("authors") or []
+        if authors:
+            lines.append(f"  author = {{{escape(' and '.join(authors))}}},")
+        for field in ("title", "journal", "year", "doi", "url"):
+            value = entry.get(field)
+            if value in (None, ""):
+                continue
+            text = str(value) if field in ("doi", "url") else escape(value)
+            lines.append(f"  {field} = {{{text}}},")
+        if not entry.get("title") and entry.get("raw"):
+            lines.append(f"  note = {{{escape(entry['raw'])}}},")
+        lines.append("}")
+        return "\n".join(lines)
+
+    @classmethod
     def standardize_entry_dict(
         cls, raw: Dict[str, Any], arxiv_id: str, default_version: str = "v1"
     ) -> Optional[Dict[str, Any]]:
-        """Chuẩn hóa một dictionary entry bất kỳ (từ JSON/CSV của Khoa) về schema thống nhất."""
+        """Chuẩn hóa một dictionary entry bất kỳ (từ JSON/CSV có sẵn) về schema thống nhất."""
         citation_key = str(
             raw.get("citation_key") or raw.get("key") or raw.get("id") or ""
         ).strip()
@@ -549,10 +666,10 @@ class ReferenceDeduplicator:
         """
         Tải toàn bộ danh sách Reference Entries của một bài báo qua các version.
         Hỗ trợ chế độ kép (Dual-mode):
-        1. Nếu Khoa đã xuất sẵn dữ liệu trong `<pub_dir>/bibtex/` (dạng JSON, CSV hoặc .bib theo version),
+        1. Nếu đã có sẵn dữ liệu trong `<pub_dir>/bibtex/` (dạng JSON, CSV hoặc .bib theo version),
            ưu tiên đọc dữ liệu từ `<pub_dir>/bibtex/` kết hợp với các nguồn theo version.
         2. Tự động đọc các file `.bib` trong `<pub_dir>/<v_name>/` và `elements/raw_references.json`
-           (của Tân) hoặc `\bibitem` trong `.tex` để không bỏ sót bất kỳ tài liệu tham khảo nào.
+           hoặc `\bibitem` trong `.tex` để không bỏ sót bất kỳ tài liệu tham khảo nào.
         """
         pub_dir = Path(pub_dir).resolve()
         arxiv_id = pub_dir.name
@@ -561,7 +678,7 @@ class ReferenceDeduplicator:
 
         collected_entries: List[Dict[str, Any]] = []
 
-        # 1. Kiểm tra nếu có các file JSON/CSV/BIB theo từng version trong <pub_dir>/bibtex/ (từ Khoa)
+        # 1. Kiểm tra nếu có các file JSON/CSV/BIB theo từng version trong <pub_dir>/bibtex/
         loaded_versions_from_bibtex_dir: Set[str] = set()
         if bibtex_dir.is_dir():
             for v_name in version_names:
@@ -582,10 +699,10 @@ class ReferenceDeduplicator:
                                             collected_entries.append(std_item)
                                 loaded_versions_from_bibtex_dir.add(v_name)
                                 break
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.warning("Skipped unreadable input: %s", exc)
 
-            # Kiểm tra nếu Khoa lưu file raw_bibtex.json hoặc bibtex_all.json chứa toàn bộ entries trước dedup
+            # Kiểm tra nếu có file raw_bibtex.json hoặc bibtex_all.json chứa toàn bộ entries trước dedup
             for raw_all_name in ("raw_bibtex.json", "bibtex_raw.json", "all_references.json"):
                 raw_all_p = bibtex_dir / raw_all_name
                 if raw_all_p.is_file() and not collected_entries:
@@ -597,10 +714,10 @@ class ReferenceDeduplicator:
                                     std_item = cls.standardize_entry_dict(item, arxiv_id, "v1")
                                     if std_item:
                                         collected_entries.append(std_item)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("Skipped unreadable input: %s", exc)
 
-        # 2. Đọc `elements/raw_references.json` (do Tân tách sẵn cho Khoa)
+        # 2. Đọc `elements/raw_references.json` (do HierarchyBuilder tách sẵn)
         raw_refs_by_ver: Dict[str, Any] = {}
         raw_refs_path = elements_dir / "raw_references.json"
         if raw_refs_path.is_file():
@@ -617,10 +734,21 @@ class ReferenceDeduplicator:
             v_dir = pub_dir / v_name
             v_entries: List[Dict[str, Any]] = []
 
-            # 3a. Quét tất cả file .bib trong thư mục version (bỏ qua file .bib mẫu của template nếu có file .bib thật)
+            # 3a. Đọc các file .bib của version. Nếu thân bài có \bibliography{a,b}
+            #     thì chỉ đọc đúng các file đó; nếu không thì đọc mọi file .bib
+            #     (bỏ qua file .bib mẫu của template nếu có file .bib thật).
             if v_dir.is_dir():
                 bib_files = sorted(v_dir.glob("**/*.bib"))
-                if len(bib_files) > 1:
+                version_refs = raw_refs_by_ver.get(v_name)
+                commands = (
+                    version_refs.get("bibliography_commands", [])
+                    if isinstance(version_refs, dict)
+                    else []
+                )
+                selected = cls.select_bib_files(bib_files, commands, v_dir)
+                if selected:
+                    bib_files = selected
+                elif len(bib_files) > 1:
                     non_sample = [
                         bf
                         for bf in bib_files
@@ -634,11 +762,13 @@ class ReferenceDeduplicator:
                 for bf in bib_files:
                     try:
                         bib_txt = bf.read_text(encoding="utf-8", errors="ignore")
-                        v_entries.extend(cls.parse_bib_content(bib_txt, arxiv_id, v_name))
-                    except Exception:
-                        pass
+                        for entry in cls.parse_bib_content(bib_txt, arxiv_id, v_name):
+                            entry["_source"] = "bib"
+                            v_entries.append(entry)
+                    except Exception as exc:
+                        logger.warning("Cannot parse %s: %s", bf, exc)
 
-            # 3b. Quét \bibitem từ raw_references.json của Tân hoặc từ full_inlined_vX.tex / .tex gốc
+            # 3b. Quét \bibitem từ raw_references.json hoặc từ full_inlined_vX.tex / .tex gốc
             bibitems_list: List[str] = []
             if v_name in raw_refs_by_ver and isinstance(raw_refs_by_ver[v_name], dict):
                 bibitems_list = raw_refs_by_ver[v_name].get("bibitem_entries", [])
@@ -663,22 +793,22 @@ class ReferenceDeduplicator:
                             for part in re.split(r"(?=\\bibitem\b)", block_m.group(1)):
                                 if part.strip().startswith("\\bibitem"):
                                     bibitems_list.append(part.strip())
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("Skipped unreadable input: %s", exc)
 
             if bibitems_list:
                 v_entries.extend(cls.parse_bibitem_entries(bibitems_list, arxiv_id, v_name))
 
             collected_entries.extend(v_entries)
 
-        # 4. Nếu vẫn rỗng mà trong <pub_dir>/bibtex/ có file .bib hoặc bibtex.json của Khoa thì đọc
+        # 4. Nếu vẫn rỗng mà trong <pub_dir>/bibtex/ có file .bib hoặc bibtex.json thì đọc
         if not collected_entries and bibtex_dir.is_dir():
             for bf in sorted(bibtex_dir.glob("*.bib")):
                 try:
                     bib_txt = bf.read_text(encoding="utf-8", errors="ignore")
                     collected_entries.extend(cls.parse_bib_content(bib_txt, arxiv_id, "v1"))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Skipped unreadable input: %s", exc)
             bib_json_p = bibtex_dir / "bibtex.json"
             if not collected_entries and bib_json_p.is_file():
                 try:
@@ -689,8 +819,8 @@ class ReferenceDeduplicator:
                                 std_item = cls.standardize_entry_dict(item, arxiv_id, "v1")
                                 if std_item:
                                     collected_entries.append(std_item)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Skipped unreadable input: %s", exc)
 
         return collected_entries
 
@@ -861,6 +991,7 @@ class ReferenceDeduplicator:
                 "arxiv_id": arxiv_id,
                 "bibtex": [],
                 "key_mapping": {},
+                "key_mapping_by_version": {},
                 "merged_details": [],
                 "stats": {
                     "total_raw_entries": 0,
@@ -942,6 +1073,9 @@ class ReferenceDeduplicator:
 
         unified_bibtex: List[Dict[str, Any]] = []
         key_mapping: Dict[str, str] = {}
+        # A key may be reused for a different paper in a later version, so the
+        # rename table used for \cite rewriting is scoped to each version.
+        key_mapping_by_version: Dict[str, Dict[str, str]] = {}
         used_canonical_keys: Set[str] = set()
         merged_details: List[Dict[str, Any]] = []
         fields_enriched_count = 0
@@ -962,9 +1096,12 @@ class ReferenceDeduplicator:
                 k = e["citation_key"]
                 if k not in distinct_keys_in_cluster:
                     distinct_keys_in_cluster.append(k)
-                # Ánh xạ old_key -> canonical_key
+                # Ánh xạ old_key -> canonical_key (bản phẳng giữ để tương thích)
                 if k not in key_mapping:
                     key_mapping[k] = canonical_key
+                key_mapping_by_version.setdefault(e.get("version") or "v1", {}).setdefault(
+                    k, canonical_key
+                )
 
             unified_entry = cls.unionize_cluster(arxiv_id, cluster, canonical_key)
             unified_bibtex.append(unified_entry)
@@ -996,12 +1133,18 @@ class ReferenceDeduplicator:
         dedup_count = len(unified_bibtex)
         removed_count = total_raw - dedup_count
         reduction_pct = round((removed_count / total_raw * 100.0), 2) if total_raw > 0 else 0.0
-        renamed_keys_count = sum(1 for k, v in key_mapping.items() if k != v)
+        renamed_keys_count = sum(
+            1
+            for mapping in key_mapping_by_version.values()
+            for old_key, new_key in mapping.items()
+            if old_key != new_key
+        )
 
         return {
             "arxiv_id": arxiv_id,
             "bibtex": unified_bibtex,
             "key_mapping": key_mapping,
+            "key_mapping_by_version": key_mapping_by_version,
             "merged_details": merged_details,
             "stats": {
                 "total_raw_entries": total_raw,
@@ -1067,18 +1210,20 @@ class ReferenceDeduplicator:
         cls,
         version_parsed_data: Dict[str, Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]],
         key_mapping: Dict[str, str],
+        key_mapping_by_version: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         """
         Quét và cập nhật toàn bộ lệnh \\cite{...} trong danh sách elements của mọi version
         TRƯỚC khi thực hiện khử trùng lặp Full-text content.
+
+        Khi có ``key_mapping_by_version``, mỗi version chỉ dùng bảng đổi tên của chính
+        nó (một key có thể bị tái sử dụng cho tài liệu khác ở version sau).
         """
         total_cmds_changed = 0
         total_keys_renamed = 0
         sample_rewrites: List[Dict[str, str]] = []
 
-        # Kiểm tra xem có key nào thực sự thay đổi không
-        has_active_mapping = any(k != v for k, v in key_mapping.items())
-        if not has_active_mapping and not key_mapping:
+        if not key_mapping and not key_mapping_by_version:
             return {
                 "cite_commands_updated": 0,
                 "cite_keys_renamed": 0,
@@ -1086,10 +1231,17 @@ class ReferenceDeduplicator:
             }
 
         for v_name, (elems, _) in version_parsed_data.items():
+            mapping = (
+                key_mapping_by_version.get(v_name, {})
+                if key_mapping_by_version is not None
+                else key_mapping
+            )
+            if not mapping:
+                continue
             for elem in elems:
                 old_content = elem.get("content", "")
                 new_content, cmds_ch, keys_ren = cls.rewrite_citations_in_text(
-                    old_content, key_mapping
+                    old_content, mapping
                 )
                 if cmds_ch > 0:
                     elem["content"] = new_content
@@ -1149,6 +1301,7 @@ class ElementDeduplicator:
         version_parsed_data: Dict[str, Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]],
         key_mapping: Optional[Dict[str, str]] = None,
         clean_before_match: bool = False,
+        key_mapping_by_version: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         """
         Khử trùng lặp phần tử trên tất cả các version của 1 bài báo.
@@ -1165,9 +1318,9 @@ class ElementDeduplicator:
             "cite_keys_renamed": 0,
             "samples": [],
         }
-        if key_mapping:
+        if key_mapping or key_mapping_by_version:
             cite_rewrite_stats = ReferenceDeduplicator.rewrite_citations_in_elements(
-                version_parsed_data, key_mapping
+                version_parsed_data, key_mapping or {}, key_mapping_by_version
             )
 
         unique_elements: List[Dict[str, Any]] = []
@@ -1280,8 +1433,13 @@ class ElementDeduplicator:
                     non_leaf_seen_in_version[(kind, norm_text)] = occ
                     sig_key = (kind, norm_text, str(occ))
                 else:
-                    # Các nút lá (sentence, block_formula, figure, item): khớp exact match theo (kind, norm_text)
-                    sig_key = (kind, norm_text)
+                    # Các nút lá (sentence, block_formula, figure, item): khớp exact match theo
+                    # (kind, norm_text, thứ tự xuất hiện trong version). Lần xuất hiện thứ k ở v1
+                    # khớp với lần thứ k ở v2, nhưng hai câu giống nhau trong CÙNG một version
+                    # vẫn là hai node riêng, nên mỗi node chỉ có một parent (cây không thành DAG).
+                    occ = non_leaf_seen_in_version.get((kind, norm_text), 0) + 1
+                    non_leaf_seen_in_version[(kind, norm_text)] = occ
+                    sig_key = (kind, norm_text, str(occ))
 
                 if sig_key in signature_to_id:
                     final_id = signature_to_id[sig_key]
@@ -1374,8 +1532,8 @@ class ElementDeduplicator:
 
 class PublicationDeduplicator:
     """
-    Điều phối trọn vẹn nhiệm vụ Deduplication (của Kiệt) cho từng bài báo:
-    1. Tải dữ liệu elements/hierarchy của từng version (từ phần của Tân & Khoa) và dữ liệu references.
+    Điều phối trọn vẹn nhiệm vụ Deduplication cho từng bài báo:
+    1. Tải dữ liệu elements/hierarchy của từng version (do các bước trước tạo ra) và dữ liệu references.
     2. Thực hiện Reference Deduplication & Field Unionization -> xuất bảng `bibtex` vào `<pub_dir>/bibtex/`
        và `<pub_dir>/elements/`.
     3. Đổi tên lệnh `\\cite{...}` trong toàn bộ `elements` theo `key_mapping`.
@@ -1389,7 +1547,7 @@ class PublicationDeduplicator:
     ) -> Tuple[List[str], Dict[str, Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]], Set[str]]:
         """
         Đọc dữ liệu `elements` và `hierarchy` theo từng version từ `<pub_dir>/elements/`.
-        Nếu bài báo chưa được chạy bước Hierarchy Construction của Tân, tự động gọi
+        Nếu bài báo chưa được chạy bước Hierarchy Construction, tự động gọi
         `HierarchyBuilder.parse_version` để đảm bảo pipeline hoạt động trơn tru.
         """
         pub_dir = Path(pub_dir).resolve()
@@ -1454,7 +1612,7 @@ class PublicationDeduplicator:
             # 1. Nếu có bản lưu trước dedup (đảm bảo tính lũy đẳng idempotent khi chạy lại)
             if pre_elems_path.is_file() and pre_hier_path.is_file():
                 try:
-                    # Kiểm tra nếu Tân/Khoa vừa chạy lại và tạo elements_{v_name}.json mới hơn có mã #vX_
+                    # Kiểm tra nếu các bước trước vừa chạy lại và tạo elements_{v_name}.json mới hơn có mã #vX_
                     use_fresh_v = False
                     if elems_v_path.is_file() and hier_v_path.is_file():
                         v_elems_check = json.loads(elems_v_path.read_text(encoding="utf-8"))
@@ -1468,10 +1626,10 @@ class PublicationDeduplicator:
                         elif version_status != "failed":
                             empty_versions.add(v_name)
                         continue
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Skipped unreadable input: %s", exc)
 
-            # 2. Nếu có sẵn file elements_vX.json chưa dedup của Tân/Khoa (chứa mã #vX_ hoặc raw_id)
+            # 2. Nếu có sẵn file elements_vX.json chưa dedup (chứa mã #vX_ hoặc raw_id)
             if elems_v_path.is_file() and hier_v_path.is_file():
                 try:
                     raw_elems = json.loads(elems_v_path.read_text(encoding="utf-8"))
@@ -1496,8 +1654,8 @@ class PublicationDeduplicator:
                         if version_status != "failed":
                             empty_versions.add(v_name)
                         continue
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Skipped unreadable input: %s", exc)
             elif tree_v_path.is_file():
                 try:
                     t_obj = json.loads(tree_v_path.read_text(encoding="utf-8"))
@@ -1506,18 +1664,18 @@ class PublicationDeduplicator:
                         continue
                     if t_obj.get("status") == "failed":
                         continue
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Skipped unreadable input: %s", exc)
 
-            # 3. Nếu chưa có bản pre_dedup, gọi HierarchyBuilder của Tân để tạo từ full_inlined_vX.tex hoặc vX/
+            # 3. Nếu chưa có bản pre_dedup, gọi HierarchyBuilder để tạo từ full_inlined_vX.tex hoặc vX/
             v_dir = pub_dir / v_name
             meta = None
             meta_p = v_dir / "metadata.json"
             if meta_p.is_file():
                 try:
                     meta = json.loads(meta_p.read_text(encoding="utf-8"))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Skipped unreadable input: %s", exc)
 
             inlined_tex, gather_res = HierarchyBuilder.load_version_tex_from_elements_or_source(
                 pub_dir=pub_dir,
@@ -1588,6 +1746,70 @@ class PublicationDeduplicator:
 
         return version_names, version_parsed_data, empty_versions
 
+    BIBTEX_COLUMNS = [
+        "arxiv_id", "citation_key", "entry_type", "title", "authors",
+        "year", "doi", "journal", "url",
+    ]
+
+    @classmethod
+    def drop_uncited_bib_entries(
+        cls,
+        entries: List[Dict[str, Any]],
+        version_parsed_data: Dict[str, Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]],
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Remove .bib entries that the version never cites.
+
+        A shared .bib file often holds hundreds of entries the paper does not
+        cite; they are not references of the paper and only add noise to the
+        matching of Milestone 3. ``\\bibitem`` entries are always kept (they are
+        printed in the paper). A version is left untouched when no citation was
+        found in it (cite extraction failed) or when it uses ``\\nocite{*}``.
+        """
+        cited_by_version: Dict[str, Optional[Set[str]]] = {}
+        for v_name, (elems, _edges) in version_parsed_data.items():
+            keys = cited_keys([e.get("content", "") for e in elems])
+            cited_by_version[v_name] = None if (not keys or "*" in keys) else keys
+
+        kept: List[Dict[str, Any]] = []
+        dropped = 0
+        for entry in entries:
+            keys = cited_by_version.get(entry.get("version") or "v1")
+            if (
+                entry.get("_source") == "bib"
+                and keys is not None
+                and entry.get("citation_key") not in keys
+            ):
+                dropped += 1
+                continue
+            kept.append(entry)
+        return kept, dropped
+
+    @classmethod
+    def _write_tables(
+        cls,
+        elem_dedup_res: Dict[str, Any],
+        bib_dedup_res: Dict[str, Any],
+        elements_dir: Path,
+        bibtex_dir: Path,
+    ) -> None:
+        """Write the CSV (bibtex only) and Parquet copies of the three tables."""
+        try:
+            import pandas as pd
+        except ImportError:
+            logger.warning("pandas is not installed: CSV/Parquet tables are not written")
+            return
+
+        df_elements = pd.DataFrame(elem_dedup_res["elements"])
+        df_hierarchy = pd.DataFrame(elem_dedup_res["hierarchy"])
+        df_bibtex = pd.DataFrame(bib_dedup_res["bibtex"], columns=cls.BIBTEX_COLUMNS)
+        df_bibtex.to_csv(bibtex_dir / "bibtex.csv", index=False, encoding="utf-8")
+        try:
+            df_elements.to_parquet(elements_dir / "elements.parquet", index=False)
+            df_hierarchy.to_parquet(elements_dir / "hierarchy.parquet", index=False)
+            df_bibtex.to_parquet(bibtex_dir / "bibtex.parquet", index=False)
+        except (ImportError, ValueError) as exc:
+            logger.warning("Parquet export failed (is pyarrow installed?): %s", exc)
+
     @classmethod
     def deduplicate_and_save_publication(
         cls, pub_dir: Path, clean_before_match: bool = True
@@ -1623,28 +1845,45 @@ class PublicationDeduplicator:
             and manifest_data[version_name].get("status") == "failed"
         )
 
-        # Bước 2: Đọc và khử trùng lặp Reference Entries (BibTeX)
+        # Bước 2: Đọc Reference Entries, bỏ các entry .bib không được cite, rồi khử trùng lặp
         raw_bib_entries = ReferenceDeduplicator.load_publication_references(pub_dir, version_names)
+        raw_bib_entries, uncited_dropped = cls.drop_uncited_bib_entries(
+            raw_bib_entries, version_parsed_data
+        )
         bib_dedup_res = ReferenceDeduplicator.deduplicate_bibtex(arxiv_id, raw_bib_entries)
+        bib_dedup_res["stats"]["uncited_bib_entries_dropped"] = uncited_dropped
 
-        # Lưu kết quả BibTeX đã khử trùng lặp vào folder `bibtex/` và `elements/`
-        bibtex_json_str = json.dumps(bib_dedup_res["bibtex"], ensure_ascii=False, indent=2)
-        (bibtex_dir / "bibtex.json").write_text(bibtex_json_str, encoding="utf-8")
-        (elements_dir / "bibtex.json").write_text(bibtex_json_str, encoding="utf-8")
-        (bibtex_dir / "citation_key_mapping.json").write_text(
-            json.dumps(bib_dedup_res["key_mapping"], ensure_ascii=False, indent=2),
+        # Lưu bảng BibTeX đã khử trùng lặp (một bản duy nhất trong `bibtex/`)
+        (bibtex_dir / "bibtex.json").write_text(
+            json.dumps(bib_dedup_res["bibtex"], ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        (bibtex_dir / "bibtex.bib").write_text(
+            "\n\n".join(
+                ReferenceDeduplicator.entry_to_bibtex(entry)
+                for entry in bib_dedup_res["bibtex"]
+            ) + ("\n" if bib_dedup_res["bibtex"] else ""),
+            encoding="utf-8",
+        )
+        (bibtex_dir / "citation_key_mapping.json").write_text(
+            json.dumps(bib_dedup_res["key_mapping_by_version"], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        for stale in ("bibtex.json", "bibtex.csv", "bibtex.parquet"):
+            stale_path = elements_dir / stale  # bản copy cũ của các lần chạy trước
+            if stale_path.is_file():
+                stale_path.unlink()
 
-        # Bước 3: Đổi tên lệnh \cite{...} trong elements & Khử trùng lặp Full-text Content
+        # Bước 3: Đổi tên lệnh \cite{...} theo từng version & khử trùng lặp Full-text Content
         elem_dedup_res = ElementDeduplicator.deduplicate_publication(
             arxiv_id=arxiv_id,
             version_parsed_data=version_parsed_data,
             key_mapping=bib_dedup_res["key_mapping"],
             clean_before_match=clean_before_match,
+            key_mapping_by_version=bib_dedup_res["key_mapping_by_version"],
         )
 
-        # Bước 4: Cập nhật ngược lại vào cây `hierarchy_tree.json` của từng version (phần của Tân)
+        # Bước 4: Cập nhật lại cây phân cấp của từng version với element_id dùng chung
         for v_name in version_names:
             if v_name in empty_versions or v_name not in elem_dedup_res["per_version_elements"]:
                 continue
@@ -1658,71 +1897,36 @@ class PublicationDeduplicator:
                 elements=v_elems,
                 hierarchy_edges=v_edges,
             )
+            manifest_record = manifest_data.get(v_name)
+            if isinstance(manifest_record, dict) and manifest_record.get("status"):
+                updated_tree["status"] = manifest_record["status"]
+            tree_json = json.dumps(updated_tree, ensure_ascii=False, indent=2)
 
             v_dir = pub_dir / v_name
             if v_dir.is_dir():
-                (v_dir / "hierarchy_tree.json").write_text(
-                    json.dumps(updated_tree, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-            (elements_dir / f"hierarchy_tree_{v_name}.json").write_text(
-                json.dumps(updated_tree, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+                (v_dir / "hierarchy_tree.json").write_text(tree_json, encoding="utf-8")
+            (elements_dir / f"hierarchy_tree_{v_name}.json").write_text(tree_json, encoding="utf-8")
             (elements_dir / f"elements_{v_name}.json").write_text(
-                json.dumps(v_elems, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+                json.dumps(v_elems, ensure_ascii=False), encoding="utf-8"
             )
             (elements_dir / f"hierarchy_{v_name}.json").write_text(
-                json.dumps(v_edges, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+                json.dumps(v_edges, ensure_ascii=False), encoding="utf-8"
             )
 
-        # Bước 5: Lưu 3 bảng chuẩn (elements, hierarchy, bibtex) ở định dạng JSON, CSV, Parquet
+        # Bước 5: Lưu 3 bảng chuẩn (elements, hierarchy, bibtex): JSON gọn + Parquet
         (elements_dir / "elements.json").write_text(
-            json.dumps(elem_dedup_res["elements"], ensure_ascii=False, indent=2),
+            json.dumps(elem_dedup_res["elements"], ensure_ascii=False),
             encoding="utf-8",
         )
         (elements_dir / "hierarchy.json").write_text(
-            json.dumps(elem_dedup_res["hierarchy"], ensure_ascii=False, indent=2),
+            json.dumps(elem_dedup_res["hierarchy"], ensure_ascii=False),
             encoding="utf-8",
         )
-
-        try:
-            import pandas as pd
-
-            df_elements = pd.DataFrame(elem_dedup_res["elements"])
-            df_elements.to_csv(elements_dir / "elements.csv", index=False, encoding="utf-8")
-
-            df_hierarchy = pd.DataFrame(elem_dedup_res["hierarchy"])
-            df_hierarchy.to_csv(elements_dir / "hierarchy.csv", index=False, encoding="utf-8")
-
-            df_bibtex = pd.DataFrame(
-                bib_dedup_res["bibtex"],
-                columns=[
-                    "arxiv_id",
-                    "citation_key",
-                    "entry_type",
-                    "title",
-                    "authors",
-                    "year",
-                    "doi",
-                    "journal",
-                    "url",
-                ],
-            )
-            df_bibtex.to_csv(bibtex_dir / "bibtex.csv", index=False, encoding="utf-8")
-            df_bibtex.to_csv(elements_dir / "bibtex.csv", index=False, encoding="utf-8")
-
-            try:
-                df_elements.to_parquet(elements_dir / "elements.parquet", index=False)
-                df_hierarchy.to_parquet(elements_dir / "hierarchy.parquet", index=False)
-                df_bibtex.to_parquet(bibtex_dir / "bibtex.parquet", index=False)
-                df_bibtex.to_parquet(elements_dir / "bibtex.parquet", index=False)
-            except Exception:
-                pass
-        except Exception:
-            pass
+        for stale in ("elements.csv", "hierarchy.csv"):
+            stale_path = elements_dir / stale
+            if stale_path.is_file():
+                stale_path.unlink()
+        cls._write_tables(elem_dedup_res, bib_dedup_res, elements_dir, bibtex_dir)
 
         # Lưu báo cáo thống kê deduplication chi tiết của bài báo
         combined_stats = {

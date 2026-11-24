@@ -1,5 +1,6 @@
 import unittest
 
+from src.parser.dedup import ReferenceDeduplicator
 from src.parser.hierarchy_builder import HierarchyBuilder
 
 
@@ -101,24 +102,25 @@ class HierarchyBuilderTests(unittest.TestCase):
         \end{document}
         """
 
-        references = HierarchyBuilder.extract_bibitems(tex)
-        bibtex = HierarchyBuilder.convert_references_to_bibtex(references)
+        # The builder sets the \bibitem entries aside; the dedup stage turns
+        # them into BibTeX entries.
+        _body, preserved = HierarchyBuilder.extract_body_and_preprocess(tex)
+        entries = ReferenceDeduplicator.parse_bibitem_entries(
+            preserved["bibitem_entries"], "paper", "v1"
+        )
+        bibtex = [ReferenceDeduplicator.entry_to_bibtex(e) for e in entries]
 
         self.assertEqual(
-            [reference["citation_key"] for reference in references],
+            [entry["citation_key"] for entry in entries],
             ["smith2021", "other"],
         )
-        self.assertEqual(references[0]["label"], "Smith et al.(2021)")
-        self.assertIn("@misc{smith2021,", bibtex[0])
+        self.assertEqual(entries[0]["year"], 2021)
+        self.assertIn("{smith2021,", bibtex[0])
         self.assertIn("year = {2021}", bibtex[0])
         self.assertIn("doi = {10.1234/example.2021}", bibtex[0])
         self.assertIn("url = {https://example.org/paper}", bibtex[0])
-        self.assertIn(
-            "note = {[Smith et al.(2021)] Smith et al. A useful paper. Journal, 2021. "
-            "DOI: 10.1234/example.2021. https://example.org/paper.}",
-            bibtex[0],
-        )
-        self.assertIn("@misc{other,", bibtex[1])
+        self.assertIn("{other,", bibtex[1])
+        self.assertEqual(entries[1]["year"], 1999)
         self.assertNotIn("commented", "\n".join(bibtex))
 
     def test_list_items_have_sentence_children_even_when_they_contain_one_sentence(self):

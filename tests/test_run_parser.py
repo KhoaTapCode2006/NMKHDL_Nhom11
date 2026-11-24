@@ -92,7 +92,9 @@ class RunParserTests(unittest.TestCase):
                 )
             )
             bibtex = json.loads(
-                (elements_dir / "bibtex.json").read_text(encoding="utf-8")
+                (source_dir / "2401.12345" / "bibtex" / "bibtex.json").read_text(
+                    encoding="utf-8"
+                )
             )
             v1_tree = json.loads(
                 (elements_dir / "hierarchy_tree_v1.json").read_text(
@@ -178,7 +180,8 @@ class RunParserTests(unittest.TestCase):
                 "\\begin{document}Persistent sentence.\\end{document}\n",
                 encoding="utf-8",
             )
-            pipeline = ParsingPipeline(source_dir=source_dir)
+            # Cleanup is opt-in: the default keeps the Milestone 1 sources.
+            pipeline = ParsingPipeline(source_dir=source_dir, clean_redundant_tex=True)
 
             first = pipeline.process_publication(publication)
             first_manifest = json.loads(

@@ -3,13 +3,18 @@ cho 2 phương pháp cào dữ liệu arXiv:
 1. arxiv_crawler (arXiv API + Source Download + Semantic Scholar API)
 2. oai_crawler   (OAI-PMH arXivRaw + Source Download + Semantic Scholar API)
 
-Tập mẫu mặc định: 50 bài báo arXiv từ ID 2510.10788 đến 2510.10837.
-Thiết kế tối ưu, tương thích hoàn toàn với môi trường Google Colab (CPU-only) và máy cục bộ.
+Tập ID lấy từ --member (đọc members.json) hoặc --year-month/--start/--end.
+Mặc định: 50 bài báo arXiv từ ID 2510.10788 đến 2510.10837.
+Testbed của đề: Google Colab CPU-only.
 
-Cách sử dụng qua CLI:
-    python benchmark.py --crawler both --clean
-    python benchmark.py --crawler arxiv --clean
-    python benchmark.py --crawler oai --clean
+Nên đo mỗi crawler trong MỘT tiến trình riêng, để RAM nền của crawler thứ hai
+không bị crawler thứ nhất làm tăng:
+    python benchmark.py --crawler arxiv --clean --member tan --members-file ../members.json
+    python benchmark.py --crawler oai   --clean --member tan --members-file ../members.json
+
+Ghi chú về đĩa: archive được giữ trong RAM, không ghi ra đĩa, nên
+``max_disk_storage_bytes`` (= output + archive lớn nhất) là ƯỚC LƯỢNG cận trên;
+hãy đối chiếu thêm với ``du -sh <thư mục output>``.
 """
 
 from __future__ import annotations
@@ -19,17 +24,18 @@ import gc
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 from pathlib import Path
 
-import arxiv
 import numpy as np
 import pandas as pd
 import psutil
 from dotenv import load_dotenv
 
 import arxiv_crawler
+import crawler_common
 import oai_crawler
 
 load_dotenv()
@@ -203,71 +209,49 @@ def benchmark_arxiv_crawler(
     monitor.start(crawler_name)
     wall_start = time.perf_counter()
 
-    paper_idx = 0
-    for batch in arxiv_crawler.chunk_list(target_ids, chunk_size=50):
-        # 1) Đo thời gian khám phá mục bài báo (Discovery Time)
-        t_disc0 = time.perf_counter()
-        search = arxiv.Search(id_list=batch)
-        papers = list(arxiv_crawler.client.results(search))
-        batch_disc_sec = time.perf_counter() - t_disc0
-        discovery_time_sec += batch_disc_sec
-        per_item_disc_sec = batch_disc_sec / max(1, len(papers))
+    # 1) Entry discovery: resolve the base IDs, then the date of every version.
+    t_disc0 = time.perf_counter()
+    papers_by_id, _missing = arxiv_crawler.discover_papers(target_ids)
+    version_dates = arxiv_crawler.fetch_version_dates(papers_by_id)
+    discovery_time_sec = time.perf_counter() - t_disc0
+    papers = [papers_by_id[i] for i in target_ids if i in papers_by_id]
+    per_item_disc_sec = discovery_time_sec / max(1, len(papers))
+    crawler_common.note_arxiv_request()  # the API client made the last arXiv request
+    # Same path as the real crawler: references of upcoming papers are fetched in
+    # the background, so a paper's time no longer includes waiting for them.
+    prefetcher = arxiv_crawler.start_reference_prefetcher(papers, save_dir, with_refs)
 
-        # 2) Đo thời gian xử lý trọn vẹn từng bài báo (References + Tải & giải nén các version)
-        for paper in papers:
-            paper_idx += 1
-            t_paper0 = time.perf_counter()
+    # 2) Full processing time of each paper (references + every version).
+    for paper_idx, paper in enumerate(papers, start=1):
+        t_paper0 = time.perf_counter()
+        base_id, num_versions = arxiv_crawler.latest_version_of(paper)
+        print(f"[{crawler_name}] ({paper_idx}/{len(target_ids)}) {base_id} (v1..v{num_versions})")
+        arxiv_crawler.crawl_paper(
+            paper,
+            save_dir=save_dir,
+            with_refs=with_refs,
+            version_dates=version_dates.get(base_id),
+            prefetcher=prefetcher,
+        )
+        paper_elapsed = time.perf_counter() - t_paper0
+        per_paper_times_sec.append(paper_elapsed)
 
-            latest = paper.entry_id.rsplit("/", 1)[-1]
-            base_id, _, latest_version = latest.rpartition("v")
-            num_versions = int(latest_version) if latest_version.isdigit() else 1
-            print(f"[{crawler_name}] ({paper_idx}/{len(target_ids)}) {base_id} (v1..v{num_versions})")
+        current_ram_mb = monitor.process.memory_info().rss / (1024 * 1024)
+        paper_events.append({
+            "crawler": crawler_name,
+            "record_type": "paper_time",
+            "step_index": paper_idx,
+            "elapsed_sec": round(time.perf_counter() - wall_start, 3),
+            "ram_mb": round(current_ram_mb, 3),
+            "delta_ram_mb": round(max(0.0, current_ram_mb - monitor.baseline_ram_mb), 3),
+            "paper_id": base_id,
+            "versions_count": num_versions,
+            "paper_time_sec": round(paper_elapsed, 3),
+            "discovery_time_sec": round(per_item_disc_sec, 3),
+        })
 
-            paper_dir = save_dir / base_id.replace("/", "-")
-            ref_file = paper_dir / "v1" / "references.json"
-            references = None
-            if ref_file.exists():
-                try:
-                    references = json.loads(ref_file.read_text(encoding="utf-8"))
-                except Exception:
-                    references = None
-
-            if references is None and with_refs:
-                try:
-                    references = arxiv_crawler.get_paper_references(base_id)
-                except Exception as exc:
-                    print(f"  [S2] Lỗi lấy references cho {base_id}: {exc}")
-                    references = None
-
-            for version_number in range(1, num_versions + 1):
-                try:
-                    res = arxiv_crawler.get_source(
-                        f"{base_id}v{version_number}",
-                        save_dir=save_dir,
-                        paper=paper,
-                        references=references,
-                    )
-                    print(f"  {base_id}v{version_number}: {res.get('source_status')}")
-                except Exception as exc:
-                    print(f"  {base_id}v{version_number}: ERROR {type(exc).__name__}: {exc}")
-
-            paper_elapsed = time.perf_counter() - t_paper0
-            per_paper_times_sec.append(paper_elapsed)
-
-            current_ram_mb = monitor.process.memory_info().rss / (1024 * 1024)
-            paper_events.append({
-                "crawler": crawler_name,
-                "record_type": "paper_time",
-                "step_index": paper_idx,
-                "elapsed_sec": round(time.perf_counter() - wall_start, 3),
-                "ram_mb": round(current_ram_mb, 3),
-                "delta_ram_mb": round(max(0.0, current_ram_mb - monitor.baseline_ram_mb), 3),
-                "paper_id": base_id,
-                "versions_count": num_versions,
-                "paper_time_sec": round(paper_elapsed, 3),
-                "discovery_time_sec": round(per_item_disc_sec, 3),
-            })
-
+    if prefetcher is not None:
+        prefetcher.stop()
     total_wall_time_sec = time.perf_counter() - wall_start
     peak_ram_mb, avg_ram_mb, baseline_ram_mb = monitor.stop(crawler_name)
     storage_stats = compute_storage_footprint(save_dir)
@@ -312,7 +296,7 @@ def benchmark_oai_crawler(
     _prepare_directory(save_dir, clean=clean)
 
     # Reset bộ đếm throttle của OAI trước khi chạy
-    oai_crawler._last_request_ts = 0.0
+    crawler_common.reset_arxiv_pacer()
 
     monitor = MemoryMonitor(interval_sec=RAM_SAMPLE_INTERVAL_SEC)
     paper_events: list[dict] = []
@@ -409,7 +393,7 @@ def save_benchmark_outputs(
     new_ts_df = pd.DataFrame(timeseries)
     if timeseries_csv.exists() and not new_ts_df.empty:
         try:
-            old_ts_df = pd.read_csv(timeseries_csv)
+            old_ts_df = pd.read_csv(timeseries_csv, dtype={"paper_id": str})
             old_ts_df = old_ts_df[~old_ts_df["crawler"].isin(new_ts_df["crawler"])]
             new_ts_df = pd.concat([old_ts_df, new_ts_df], ignore_index=True)
         except Exception:
@@ -423,6 +407,9 @@ def save_benchmark_outputs(
 
 
 def parse_args() -> argparse.Namespace:
+    # Help and logs are Vietnamese; a Windows console (cp1252) cannot encode them.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="Benchmarking hiệu năng end-to-end cho arxiv_crawler và oai_crawler."
     )
@@ -479,14 +466,25 @@ def parse_args() -> argparse.Namespace:
         default="benchmark_timeseries.csv",
         help="Đường dẫn file CSV lưu mẫu RAM và thời gian xử lý từng bài.",
     )
+    parser.add_argument(
+        "--member",
+        default=None,
+        help="Tên thành viên trong members.json; nếu có sẽ thay cho --year-month/--start/--end.",
+    )
+    parser.add_argument(
+        "--members-file",
+        default="members.json",
+        help="File JSON chứa khoảng ID của từng thành viên (mặc định: members.json).",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    target_ids = [
-        f"{args.year_month}.{seq:05d}" for seq in range(args.start, args.end + 1)
-    ]
+    if args.member:
+        target_ids = crawler_common.load_member_ids(Path(args.members_file), args.member)
+    else:
+        target_ids = crawler_common.ids_from_range(args.year_month, args.start, args.end)
     with_refs = not args.no_refs
 
     summaries: list[dict] = []

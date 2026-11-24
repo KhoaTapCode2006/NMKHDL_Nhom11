@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,13 +23,16 @@ class RunHierarchyTests(unittest.TestCase):
 
             result = process_publication_hierarchy(publication_dir)
 
-            bib_file = elements_dir / "references_v1.bib"
+            bibtex_dir = publication_dir / "bibtex"
+            bib_file = bibtex_dir / "bibtex.bib"
+            table = json.loads((bibtex_dir / "bibtex.json").read_text(encoding="utf-8"))
             self.assertEqual(result["tex_versions"], 1)
             self.assertTrue(bib_file.is_file())
             bibtex = bib_file.read_text(encoding="utf-8")
-            self.assertIn("@misc{key,", bibtex)
+            self.assertIn("{key,", bibtex)
             self.assertIn("year = {2020}", bibtex)
-            self.assertIn("note = {Author. Title, 2020.}", bibtex)
+            self.assertEqual([row["citation_key"] for row in table], ["key"])
+            self.assertEqual(table[0]["year"], 2020)
 
 
 if __name__ == "__main__":
