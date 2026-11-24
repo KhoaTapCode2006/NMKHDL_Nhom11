@@ -380,6 +380,8 @@ def save_benchmark_outputs(
     timeseries_csv: Path,
 ) -> None:
     """Lưu kết quả tổng hợp và chuỗi thời gian vào file CSV (cập nhật hoặc ghi mới)."""
+    results_csv.parent.mkdir(parents=True, exist_ok=True)
+    timeseries_csv.parent.mkdir(parents=True, exist_ok=True)
     new_res_df = pd.DataFrame(summaries)
     if results_csv.exists() and not new_res_df.empty:
         try:
@@ -456,14 +458,15 @@ def parse_args() -> argparse.Namespace:
         default="./sourcesOAI",
         help="Thư mục đầu ra cho oai_crawler (mặc định: ./sourcesOAI).",
     )
+    default_bench_dir = Path(__file__).resolve().parent.parent / "data" / "benchmarks"
     parser.add_argument(
         "--results-csv",
-        default="benchmark_results.csv",
+        default=str(default_bench_dir / "benchmark_results.csv"),
         help="Đường dẫn file CSV lưu kết quả tổng hợp.",
     )
     parser.add_argument(
         "--timeseries-csv",
-        default="benchmark_timeseries.csv",
+        default=str(default_bench_dir / "benchmark_timeseries.csv"),
         help="Đường dẫn file CSV lưu mẫu RAM và thời gian xử lý từng bài.",
     )
     parser.add_argument(

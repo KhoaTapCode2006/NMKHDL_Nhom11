@@ -4,16 +4,23 @@ project:
   id: b71f1e95-eb6b-4fd3-b9c2-8e86690f4f20
   title: "NMKHDL - Nhóm 11"
   toc:
-    - file: src/final.ipynb
-  # description:
-  # keywords: []
-  # authors: []
+    - title: "Milestone 1 — Data Crawling"
+      children:
+        - file: reports/final.ipynb
+    - title: "Milestone 2 — Hierarchical Parsing & Standardization"
+      children:
+        - file: reports/Milestone2_Parsing_Report (2).ipynb
+        - file: reports/Hoang_Multi_File_Gathering_Report.ipynb
+        - file: reports/Tan_Hierarchy_Construction.ipynb
+        - file: reports/Hierarchy_Normalizer_Report.ipynb
+        - file: reports/Kiet_Deduplication.ipynb
+        - file: reports/Hoang_Benchmark_and_Statistic.ipynb
+    - title: "Milestone 3 — Reference Matching Pipeline"
+      children:
+        - file: reports/Manual_Labeling_Report.ipynb
+        - file: reports/Hoang_Milestone3_Feature_Engineering_and_Auto_Labeling.ipynb
   exclude:
     - README.md
   github: https://github.com/KhoaTapCode2006/NMKHDL_Nhom11
-  # To autogenerate a Table of Contents, run "jupyter book init --write-toc"
 site:
   template: book-theme
-  # options:
-  #   favicon: favicon.ico
-  #   logo: site_logo.png

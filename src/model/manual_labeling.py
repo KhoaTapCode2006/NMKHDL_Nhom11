@@ -268,13 +268,6 @@ MANUAL_POOL_20_IDS: Tuple[str, ...] = (
     "2407.17860",
 )
 
-VERIFIED_MANUAL_OVERRIDES: Dict[Tuple[str, str], str] = {
-    ("2407.17850", "gan_2014"): "",
-    ("2505.20674", "hoffmann2022empirical"): "2203.15556",
-    ("2506.10792", "18"): "2009.09979",
-    ("2411.13807", "w-coda"): "2507.01735",
-}
-
 
 def expand_segments_to_ids(
     segments: Sequence[Tuple[str, int, int]],
@@ -1016,9 +1009,6 @@ def prepare_manual_review(
                 secondary["review_status"] = "NEEDS_HUMAN_CHECK"
 
     for row in review_rows:
-        key = (row["arxiv_id"], row["citation_key"])
-        if key in VERIFIED_MANUAL_OVERRIDES:
-            row["groundtruth_arxiv_id"] = VERIFIED_MANUAL_OVERRIDES[key]
         # The pre-filled value is only a suggestion. Keep it apart so finalize can
         # report how often the reviewer changed it, and start every row as not
         # reviewed: a person must confirm or correct each label.

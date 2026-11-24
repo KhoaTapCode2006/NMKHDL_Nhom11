@@ -29,8 +29,16 @@ crawl_log.json
 *.tar.gz
 *.gz
 
-# Generated run outputs (labels, matrices, predictions, cleaned tables)
+# Generated run outputs (labels, matrices, predictions, cleaned tables, benchmarks)
 dedup_summary_stats.json
+benchmark_report.md
+benchmark_results.csv
+benchmark_stats.json
+benchmark_timeseries.csv
+src/benchmark_report.md
+src/benchmark_results.csv
+src/benchmark_stats.json
+src/benchmark_timeseries.csv
 data/
 src/data/
 

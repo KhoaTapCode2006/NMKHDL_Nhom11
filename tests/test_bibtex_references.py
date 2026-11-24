@@ -5,7 +5,15 @@ import unittest
 from pathlib import Path
 
 from src.parser.dedup import ReferenceDeduplicator
-from src.run_hierarchy import process_publication_hierarchy
+from src.parser.pipeline import ParsingPipeline
+
+
+def process_publication_hierarchy(pub_dir: Path):
+    pub_dir = Path(pub_dir).resolve()
+    return ParsingPipeline(
+        source_dir=pub_dir.parent,
+        clean_redundant_tex=False,
+    ).process_publication(pub_dir)
 
 
 def parse_bibtex(text):

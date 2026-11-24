@@ -1,5 +1,12 @@
+"""Unit tests for src/milestone_pipeline.py (stages, sharded Parquet, schemas)."""
+
+from __future__ import annotations
+
 import json
+import tempfile
+import unittest
 from pathlib import Path
+from unittest import mock
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -119,11 +126,11 @@ def test_export_tables_preserves_required_columns_and_types(tmp_path):
     _write_parser_outputs(source_dir)
     milestone_pipeline.export_parsing_tables(source_dir, dataset_dir)
 
-    papers = pq.read_table(dataset_dir / "data" / "papers" / "papers.parquet")
-    refs = pq.read_table(dataset_dir / "data" / "references" / "references.parquet")
-    elements = pq.read_table(dataset_dir / "data" / "elements" / "elements.parquet")
-    hierarchy = pq.read_table(dataset_dir / "data" / "hierarchy" / "hierarchy.parquet")
-    bibtex = pq.read_table(dataset_dir / "data" / "bibtex" / "bibtex.parquet")
+    papers = pq.read_table(dataset_dir / "data" / "papers")
+    refs = pq.read_table(dataset_dir / "data" / "references")
+    elements = pq.read_table(dataset_dir / "data" / "elements")
+    hierarchy = pq.read_table(dataset_dir / "data" / "hierarchy")
+    bibtex = pq.read_table(dataset_dir / "data" / "bibtex")
 
     assert papers.schema.equals(milestone_pipeline.TABLE_SCHEMAS["papers"])
     assert papers.num_rows == 1
@@ -165,15 +172,15 @@ def test_pipeline_runs_stages_in_order_and_writes_dataset_card(tmp_path, monkeyp
 
     def fake_parse(argv):
         stages.append("parse")
-        assert (dataset_dir / "data" / "papers" / "papers.parquet").is_file()
-        assert (dataset_dir / "data" / "references" / "references.parquet").is_file()
+        assert list((dataset_dir / "data" / "papers").glob("*.parquet"))
+        assert list((dataset_dir / "data" / "references").glob("*.parquet"))
         _write_parser_outputs(source_dir)
         return 0
 
     def fake_matching(**kwargs):
         stages.append("matching")
         assert all(
-            (dataset_dir / "data" / table / f"{table}.parquet").is_file()
+            list((dataset_dir / "data" / table).glob("*.parquet"))
             for table in ("elements", "hierarchy", "bibtex")
         )
         output_dir = kwargs["output_dir"]
@@ -207,7 +214,7 @@ def test_pipeline_runs_stages_in_order_and_writes_dataset_card(tmp_path, monkeyp
     for table in milestone_pipeline.TABLE_SCHEMAS:
         assert f"config_name: {table}" in card
         assert f"path: data/{table}/*.parquet" in card
-    predictions = pq.read_table(dataset_dir / "data" / "predictions" / "predictions.parquet")
+    predictions = pq.read_table(dataset_dir / "data" / "predictions")
     assert predictions.schema.equals(milestone_pipeline.TABLE_SCHEMAS["predictions"])
     assert predictions.column("cand_1").to_pylist() == ["2301.12345"]
 
@@ -249,3 +256,245 @@ def test_pipeline_stops_if_parsing_fails(tmp_path, monkeypatch):
         milestone_pipeline.run_pipeline(args)
 
     assert not matching_called
+
+
+def _write_sample_crawled_and_parsed_pub(
+    source_dir: Path,
+    arxiv_id: str = "2407.17839",
+    weird_year: object = "2021a",
+) -> Path:
+    pub_dir = source_dir / arxiv_id
+    v1_dir = pub_dir / "v1"
+    v2_dir = pub_dir / "v2"
+    elements_dir = pub_dir / "elements"
+    bibtex_dir = pub_dir / "bibtex"
+    for d in (v1_dir, v2_dir, elements_dir, bibtex_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    _write_json(
+        v1_dir / "metadata.json",
+        {
+            "arxiv_id": f"{arxiv_id}v1",
+            "base_id": arxiv_id,
+            "version": "1",
+            "title": "Sample Paper Title",
+            "authors": ["Alice Smith", "Bob Jones"],
+            "submission_date": "2024-07-01T00:00:00Z",
+            "version_date": "2024-07-01T00:00:00Z",
+            "revised_dates": ["2024-07-15T00:00:00Z"],
+            "venue": "NeurIPS 2024",
+        },
+    )
+    _write_json(
+        v2_dir / "metadata.json",
+        {
+            "arxiv_id": f"{arxiv_id}v2",
+            "base_id": arxiv_id,
+            "version": "2",
+            "title": "Sample Paper Title Revised",
+            "authors": ["Alice Smith", "Bob Jones"],
+            "submission_date": "2024-07-01T00:00:00Z",
+            "version_date": "2024-07-15T00:00:00Z",
+            "revised_dates": ["2024-07-15T00:00:00Z"],
+            "venue": "NeurIPS 2024",
+        },
+    )
+    refs = [
+        {
+            "paperId": "s2_abc",
+            "externalIds": {"ArXiv": "1706.03762"},
+            "title": "Attention Is All You Need",
+            "authors": [{"name": "Ashish Vaswani"}],
+            "year": 2017,
+            "publicationDate": "2017-06-12",
+            "venue": "NeurIPS",
+        },
+        {
+            "paperId": "s2_non_arxiv",
+            "externalIds": {"DOI": "10.1000/xyz"},
+            "title": "Journal Only Paper",
+            "authors": [{"name": "Carol Dan"}],
+            "year": 2019,
+        },
+    ]
+    _write_json(v1_dir / "references.json", refs)
+    _write_json(v2_dir / "references.json", refs)
+
+    _write_json(
+        elements_dir / "elements.json",
+        [
+            {
+                "element_id": f"{arxiv_id}#root1",
+                "arxiv_id": arxiv_id,
+                "kind": "document",
+                "content": "Version 1 root",
+            },
+            {
+                "element_id": f"{arxiv_id}#h1",
+                "arxiv_id": arxiv_id,
+                "kind": "section",
+                "content": "Introduction",
+            },
+            {
+                "element_id": f"{arxiv_id}#s1",
+                "arxiv_id": arxiv_id,
+                "kind": "sentence",
+                "content": r"We build on Transformers \cite{vaswani2017}.",
+            },
+        ],
+    )
+    _write_json(
+        elements_dir / "hierarchy.json",
+        [
+            {
+                "arxiv_id": arxiv_id,
+                "version": 1,
+                "element_id": f"{arxiv_id}#h1",
+                "parent_id": f"{arxiv_id}#root1",
+            },
+            {
+                "arxiv_id": arxiv_id,
+                "version": 1,
+                "element_id": f"{arxiv_id}#s1",
+                "parent_id": f"{arxiv_id}#h1",
+            },
+        ],
+    )
+    _write_json(
+        bibtex_dir / "bibtex.json",
+        [
+            {
+                "arxiv_id": arxiv_id,
+                "citation_key": "vaswani2017",
+                "entry_type": "article",
+                "title": "Attention Is All You Need",
+                "authors": ["Ashish Vaswani"],
+                "year": weird_year,
+                "doi": "",
+                "journal": "NeurIPS",
+                "url": "https://arxiv.org/abs/1706.03762",
+            }
+        ],
+    )
+    return pub_dir
+
+
+class MilestonePipelineOptimizationTests(unittest.TestCase):
+    def test_sharded_export_multiple_sources_and_noisy_year_handling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src1 = root / "src1"
+            src2 = root / "src2"
+            dataset_dir = root / "hf_dataset"
+            match_dir = root / "matching_out"
+            match_dir.mkdir(parents=True)
+
+            _write_sample_crawled_and_parsed_pub(src1, "2407.17839", weird_year="2017a")
+            _write_sample_crawled_and_parsed_pub(src2, "2506.10788", weird_year="invalid")
+
+            pd.DataFrame(
+                [
+                    {
+                        "arxiv_id": "2407.17839",
+                        "partition": "test",
+                        "citation_key": "vaswani2017",
+                        "groundtruth_arxiv_id": "1706.03762",
+                        "cand_1": "1706.03762",
+                        "cand_2": None,
+                        "cand_3": None,
+                        "cand_4": None,
+                        "cand_5": None,
+                    }
+                ]
+            ).to_parquet(match_dir / "predictions.parquet", index=False)
+
+            rc = milestone_pipeline.main(
+                [
+                    "--export-only",
+                    "--source-dir",
+                    str(src1),
+                    str(src2),
+                    "--matching-output-dir",
+                    str(match_dir),
+                    "--dataset-dir",
+                    str(dataset_dir),
+                    "--shard-rows",
+                    "2",
+                ]
+            )
+            self.assertEqual(rc, 0)
+
+            elem_shards = sorted((dataset_dir / "data" / "elements").glob("*.parquet"))
+            self.assertEqual(len(elem_shards), 3)
+            elem_table = pq.read_table(dataset_dir / "data" / "elements")
+            self.assertEqual(elem_table.num_rows, 6)
+            self.assertEqual(elem_table.schema, milestone_pipeline.TABLE_SCHEMAS["elements"])
+
+            bib_df = pq.read_table(dataset_dir / "data" / "bibtex").to_pandas()
+            by_pub = dict(zip(bib_df["arxiv_id"], bib_df["year"]))
+            self.assertEqual(int(by_pub["2407.17839"]), 2017)
+            self.assertTrue(pd.isna(by_pub["2506.10788"]))
+
+            papers_df = pq.read_table(dataset_dir / "data" / "papers").to_pandas()
+            self.assertEqual(sorted(papers_df["arxiv_id"].tolist()), ["2407.17839", "2506.10788"])
+
+            refs_df = pq.read_table(dataset_dir / "data" / "references").to_pandas()
+            self.assertEqual(len(refs_df), 2)
+            self.assertTrue((refs_df["ref_arxiv_id"] == "1706.03762").all())
+
+            card_text = (dataset_dir / "README.md").read_text(encoding="utf-8")
+            for table_name in milestone_pipeline.TABLE_SCHEMAS:
+                self.assertIn(f"- config_name: {table_name}", card_text)
+                self.assertIn(f"path: data/{table_name}/*.parquet", card_text)
+
+    def test_skip_match_does_not_require_manual_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_dir = root / "sources"
+            dataset_dir = root / "hf"
+
+            def _fake_crawl(ids, save_dir, with_refs=True):
+                for pid in ids:
+                    pub = Path(save_dir) / pid / "v1"
+                    pub.mkdir(parents=True, exist_ok=True)
+                    _write_json(
+                        pub / "metadata.json",
+                        {
+                            "arxiv_id": f"{pid}v1",
+                            "base_id": pid,
+                            "version": "1",
+                            "title": "Test",
+                            "authors": ["Author A"],
+                            "submission_date": "2024-07-01T00:00:00Z",
+                            "revised_dates": [],
+                        },
+                    )
+                    (pub / "references.json").write_text("[]", encoding="utf-8")
+                    (pub / "main.tex").write_text(
+                        r"\documentclass{article}\begin{document}\section{Intro}Hello world.\end{document}",
+                        encoding="utf-8",
+                    )
+                return {"requested": len(ids), "resolved": len(ids), "missing_ids": []}
+
+            with mock.patch.object(milestone_pipeline.arxiv_crawler, "crawl", side_effect=_fake_crawl):
+                rc = milestone_pipeline.main(
+                    [
+                        "--ids",
+                        "2407.17839",
+                        "--skip-match",
+                        "--source-dir",
+                        str(source_dir),
+                        "--dataset-dir",
+                        str(dataset_dir),
+                        "--work-dir",
+                        str(root / "work"),
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            for name in ("papers", "references", "elements", "hierarchy", "bibtex"):
+                self.assertTrue(list((dataset_dir / "data" / name).glob("*.parquet")))
+            self.assertFalse((dataset_dir / "data" / "predictions").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

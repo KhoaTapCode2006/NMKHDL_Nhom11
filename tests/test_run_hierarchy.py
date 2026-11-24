@@ -3,7 +3,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.run_hierarchy import process_publication_hierarchy
+from src.parser.pipeline import ParsingPipeline
+
+
+def _process_publication_hierarchy(pub_dir: Path):
+    pub_dir = Path(pub_dir).resolve()
+    return ParsingPipeline(
+        source_dir=pub_dir.parent,
+        clean_redundant_tex=False,
+    ).process_publication(pub_dir)
 
 
 class RunHierarchyTests(unittest.TestCase):
@@ -21,7 +29,7 @@ class RunHierarchyTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = process_publication_hierarchy(publication_dir)
+            result = _process_publication_hierarchy(publication_dir)
 
             bibtex_dir = publication_dir / "bibtex"
             bib_file = bibtex_dir / "bibtex.bib"
