@@ -29,6 +29,7 @@ import argparse
 import difflib
 import html
 import json
+import random
 import re
 import shutil
 from pathlib import Path
@@ -444,17 +445,21 @@ def crawl_team20_manual_pool(
     papers_per_member: int = 5,
     scan_window_per_member: int = 40,
     manifest_out: Path = Path("data/manual_labeling/manual_pool_manifest.json"),
+    seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Crawl & parse 5 eligible manual-labeling papers for each of the 4 team members (total 20)."""
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     all_selected: Dict[str, List[Dict[str, Any]]] = {}
 
-    for member_key, segments in TEAM_MEMBER_RANGES.items():
+    for idx, (member_key, segments) in enumerate(TEAM_MEMBER_RANGES.items()):
         print(f"\n============================================================")
         print(f"[team20] Collecting {papers_per_member} eligible papers for {member_key}...")
         print(f"============================================================")
         candidate_ids = expand_segments_to_ids(segments, max_ids=scan_window_per_member)
+        if seed is not None:
+            rng = random.Random(seed + idx)
+            rng.shuffle(candidate_ids)
         res = crawl_custom_range(
             out_dir=out_dir,
             ids=candidate_ids,
@@ -1294,6 +1299,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("data/manual_labeling/manual_pool_manifest.json"),
     )
+    p_t20.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional random seed to shuffle candidate IDs within the scan window",
+    )
 
     # 2. copy-eligible
     p_copy = sub.add_parser(
@@ -1384,6 +1395,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             papers_per_member=args.papers_per_member,
             scan_window_per_member=args.scan_window,
             manifest_out=args.manifest_out,
+            seed=args.seed,
         )
         return 0
 
