@@ -618,17 +618,30 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Also measure peak heap with tracemalloc (slows the run; not for timing).",
     )
+    default_benchmarks_dir = src_dir.parent / "data" / "benchmarks"
+    parser.add_argument(
+        "--stage",
+        choices=("all", "normalize", "dedup"),
+        default="all",
+        help="Pipeline stage to execute: full pipeline ('all') or a single stage.",
+    )
     parser.add_argument(
         "--report-md",
         type=Path,
-        default=src_dir / "benchmark_report.md",
+        default=default_benchmarks_dir / "benchmark_report.md",
         help="Path to the Markdown benchmark report.",
     )
     parser.add_argument(
         "--stats-json",
         type=Path,
-        default=src_dir / "benchmark_stats.json",
+        default=default_benchmarks_dir / "benchmark_stats.json",
         help="Path to the JSON benchmark statistics.",
+    )
+    parser.add_argument(
+        "--dedup-summary-json",
+        type=Path,
+        default=None,
+        help="Optional path to write detailed deduplication summary JSON.",
     )
     parser.add_argument(
         "--limit",
@@ -637,6 +650,98 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Maximum number of publications to process.",
     )
     return parser.parse_args(argv)
+
+
+def _run_dedup_stage(
+    pub_dirs: List[Path], summary_json: Optional[Path] = None
+) -> Dict[str, Any]:
+    start_time = time.perf_counter()
+    pub_results: List[Dict[str, Any]] = []
+    total_elems_before = 0
+    total_elems_after = 0
+    total_bib_before = 0
+    total_bib_after = 0
+    total_renamed_keys = 0
+    total_cite_cmds_updated = 0
+    total_enriched_entries = 0
+    by_kind_before_global: Dict[str, int] = {}
+    by_kind_after_global: Dict[str, int] = {}
+
+    for index, pub_dir in enumerate(pub_dirs, 1):
+        res = ParsingPipeline.deduplicate_publication(
+            pub_dir=pub_dir, clean_before_match=True
+        )
+        pub_results.append(res)
+        e_stat = res["elements_dedup"]
+        b_stat = res["bibtex_dedup"]
+        total_elems_before += e_stat["total_before"]
+        total_elems_after += e_stat["total_after"]
+        total_bib_before += b_stat["total_raw_entries"]
+        total_bib_after += b_stat["dedup_entries_count"]
+        total_renamed_keys += b_stat["renamed_keys_count"]
+        total_cite_cmds_updated += e_stat.get("cite_commands_updated", 0)
+        total_enriched_entries += b_stat.get("fields_enriched_count", 0)
+        for kind, cnt in e_stat.get("by_kind_before", {}).items():
+            by_kind_before_global[kind] = by_kind_before_global.get(kind, 0) + cnt
+        for kind, cnt in e_stat.get("by_kind_after", {}).items():
+            by_kind_after_global[kind] = by_kind_after_global.get(kind, 0) + cnt
+        print(
+            f"[{index:02d}/{len(pub_dirs):02d}] {res['arxiv_id']} ({res['total_versions']}v) | "
+            f"elements: {e_stat['total_before']} -> {e_stat['total_after']} | "
+            f"BibTeX: {b_stat['total_raw_entries']} -> {b_stat['dedup_entries_count']}"
+        )
+
+    elapsed = time.perf_counter() - start_time
+    elems_removed = total_elems_before - total_elems_after
+    bib_removed = total_bib_before - total_bib_after
+    summary = {
+        "publications": len(pub_dirs),
+        "elapsed_sec": round(elapsed, 3),
+        "elements": {
+            "before": total_elems_before,
+            "after": total_elems_after,
+            "removed": elems_removed,
+            "reduction_percentage": round(
+                elems_removed / total_elems_before * 100.0, 2
+            )
+            if total_elems_before > 0
+            else 0.0,
+            "by_kind_before": by_kind_before_global,
+            "by_kind_after": by_kind_after_global,
+        },
+        "bibtex": {
+            "before": total_bib_before,
+            "after": total_bib_after,
+            "removed": bib_removed,
+            "reduction_percentage": round(
+                bib_removed / total_bib_before * 100.0, 2
+            )
+            if total_bib_before > 0
+            else 0.0,
+            "renamed_keys": total_renamed_keys,
+            "entries_enriched": total_enriched_entries,
+            "cite_commands_updated": total_cite_cmds_updated,
+        },
+        "per_publication": [
+            {
+                "arxiv_id": res["arxiv_id"],
+                "total_versions": res["total_versions"],
+                "tex_versions": res["tex_versions"],
+                "empty_versions": res["empty_versions"],
+                "failed_versions": res["failed_versions"],
+                "elements_dedup": res["elements_dedup"],
+                "bibtex_dedup": res["bibtex_dedup"],
+            }
+            for res in pub_results
+        ],
+    }
+    if summary_json is not None:
+        summary_json.parent.mkdir(parents=True, exist_ok=True)
+        summary_json.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"Deduplication summary JSON: {summary_json}")
+    return summary
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -649,15 +754,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Error: Source directory does not exist: {source_dir}")
         return 1
 
+    pub_dirs = ParsingPipeline.find_publications(source_dir)
+    if args.limit is not None:
+        pub_dirs = pub_dirs[: args.limit]
+
+    if args.stage == "normalize":
+        outputs: List[Path] = []
+        for pub_dir in pub_dirs:
+            outputs.extend(ParsingPipeline.normalize_publication(pub_dir))
+        if not outputs:
+            print(f"Error: No hierarchy tree files found under: {source_dir}")
+            return 1
+        print(f"Normalized {len(outputs)} hierarchy tree(s).")
+        return 0
+
+    if args.stage == "dedup":
+        _run_dedup_stage(pub_dirs, summary_json=args.dedup_summary_json)
+        return 0
+
     benchmark = ParserBenchmark(trace_memory=args.trace_memory)
     pipeline = ParsingPipeline(
         source_dir=source_dir,
         clean_redundant_tex=args.clean_tex,
         benchmark=benchmark,
     )
-    pub_dirs = ParsingPipeline.find_publications(source_dir)
-    if args.limit is not None:
-        pub_dirs = pub_dirs[: args.limit]
 
     print("=" * 60)
     print("LaTeX gathering and parsing pipeline")
@@ -684,12 +804,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         path / sub for path in pub_dirs for sub in ("elements", "bibtex")
     )
     summary = benchmark.generate_summary()
+    args.report_md.parent.mkdir(parents=True, exist_ok=True)
     report = benchmark.export_markdown_report(args.report_md)
     args.stats_json.parent.mkdir(parents=True, exist_ok=True)
     args.stats_json.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    if args.dedup_summary_json is not None:
+        args.dedup_summary_json.parent.mkdir(parents=True, exist_ok=True)
+        args.dedup_summary_json.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     print(f"Markdown report: {args.report_md}")
     print(f"Statistics JSON: {args.stats_json}")
     print(report)

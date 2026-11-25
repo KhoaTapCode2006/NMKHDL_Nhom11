@@ -42,7 +42,7 @@ import math
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Union
 
 import pandas as pd
 
@@ -96,8 +96,14 @@ def publication_key(value: object) -> str:
     return normalize_arxiv_id(text) or text
 
 
+def _normalize_source_dirs(source_dir: Union[Path, Sequence[Path]]) -> List[Path]:
+    if isinstance(source_dir, (str, Path)):
+        return [Path(source_dir)]
+    return [Path(p) for p in source_dir]
+
+
 def run(
-    source_dir: Path,
+    source_dir: Union[Path, Sequence[Path]],
     manual_labels_path: Path,
     output_dir: Path,
     num_members: int = 4,
@@ -108,13 +114,30 @@ def run(
 ) -> Dict[str, object]:
     started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
+    source_dirs = _normalize_source_dirs(source_dir)
 
     # 1. Tables ------------------------------------------------------------
-    bibtex = collect_bibtex_tables(source_dir)
-    if bibtex.empty:
-        raise SystemExit(f"No bibtex/bibtex.json found under {source_dir}")
+    bib_frames = [collect_bibtex_tables(d) for d in source_dirs if d.is_dir()]
+    bib_frames = [f for f in bib_frames if not f.empty]
+    if not bib_frames:
+        raise SystemExit(f"No bibtex/bibtex.json found under {source_dirs}")
+    bibtex = pd.concat(bib_frames, ignore_index=True)
     bibtex["arxiv_id"] = bibtex["arxiv_id"].map(publication_key)
-    references = clean_references_table(flatten_references_json(source_dir))
+    if "citation_key" in bibtex.columns:
+        bibtex = bibtex.drop_duplicates(
+            subset=["arxiv_id", "citation_key"], keep="first"
+        ).reset_index(drop=True)
+
+    ref_frames = [flatten_references_json(d) for d in source_dirs if d.is_dir()]
+    ref_frames = [f for f in ref_frames if not f.empty]
+    raw_references = (
+        pd.concat(ref_frames, ignore_index=True) if ref_frames else pd.DataFrame()
+    )
+    references = (
+        clean_references_table(raw_references)
+        if not raw_references.empty
+        else clean_references_table(pd.DataFrame(columns=["citing_arxiv_id", "ref_arxiv_id"]))
+    )
     build_references_table(references).to_parquet(output_dir / "references_table.parquet", index=False)
 
     manual = normalize_labels(read_table(manual_labels_path), default_source="manual")
@@ -151,7 +174,11 @@ def run(
     (output_dir / "split.json").write_text(json.dumps(split, indent=2), encoding="utf-8")
 
     # 4. Candidate matrix (every entry of the split publications) -----------
-    hierarchy = load_hierarchy_summary(source_dir, split_pubs)
+    hierarchy: Dict[str, Dict[str, dict]] = {}
+    for d in source_dirs:
+        if d.is_dir():
+            for pub_id, pub_summary in load_hierarchy_summary(d, split_pubs).items():
+                hierarchy.setdefault(pub_id, {}).update(pub_summary)
     extractor = FeatureExtractor(hierarchy_summary=hierarchy)
     split_bibtex = bibtex[bibtex["arxiv_id"].isin(split_pubs)]
     split_refs = references[references["citing_arxiv_id"].isin(split_pubs)]
@@ -208,7 +235,13 @@ def run(
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Milestone 3 reference matching pipeline")
-    parser.add_argument("--source-dir", type=Path, required=True)
+    parser.add_argument(
+        "--source-dir",
+        type=Path,
+        nargs="+",
+        required=True,
+        help="One or more directories containing crawled and parsed publications",
+    )
     parser.add_argument("--manual-labels", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("data/matching"))
     parser.add_argument("--num-members", type=int, default=4)
@@ -220,8 +253,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
+    source_arg: Union[Path, Sequence[Path]] = (
+        args.source_dir[0] if len(args.source_dir) == 1 else args.source_dir
+    )
     summary = run(
-        args.source_dir, args.manual_labels, args.output_dir, args.num_members,
+        source_arg, args.manual_labels, args.output_dir, args.num_members,
         args.members_file, args.auto_ratio, args.seed, not args.no_ablation,
     )
     test = summary["test_metrics"]

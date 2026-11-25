@@ -396,6 +396,7 @@ def select_and_evaluate(
         notes.append("Validation has no matchable manual entry: selection uses all of valid.")
 
     rows = []
+    valid_rankings_by_choice: Dict[Tuple[str, str], pd.DataFrame] = {}
     for name, factory in factories.items():
         try:
             model = factory(None).fit(train)
@@ -405,7 +406,9 @@ def select_and_evaluate(
         valid_scored = score_frame(model, valid)
         test_scored = score_frame(model, test)
         for mode in postprocessing_modes:
-            v = evaluate_by_source(postprocess_rankings(valid_scored, mode), valid)
+            v_ranked = postprocess_rankings(valid_scored, mode)
+            valid_rankings_by_choice[(name, mode)] = v_ranked
+            v = evaluate_by_source(v_ranked, valid)
             t = evaluate_by_source(postprocess_rankings(test_scored, mode), test)
             row = {"model": name, "postprocessing": mode}
             for split_name, metrics in (("valid", v), ("test", t)):
@@ -425,12 +428,14 @@ def select_and_evaluate(
     best = ordered.iloc[0]
     comparison = ordered.drop(columns=["_score", "_tiebreak"]).reset_index(drop=True)
 
-    final_model = factories[best["model"]](None).fit(pd.concat([train, valid]))
-    test_rankings = postprocess_rankings(score_frame(final_model, test), best["postprocessing"])
-    valid_rankings = postprocess_rankings(score_frame(final_model, valid), best["postprocessing"])
+    best_key = (str(best["model"]), str(best["postprocessing"]))
+    valid_rankings = valid_rankings_by_choice[best_key]
+
+    final_model = factories[best_key[0]](None).fit(pd.concat([train, valid]))
+    test_rankings = postprocess_rankings(score_frame(final_model, test), best_key[1])
     return ExperimentResults(
-        selected_model=str(best["model"]),
-        selected_postprocessing=str(best["postprocessing"]),
+        selected_model=best_key[0],
+        selected_postprocessing=best_key[1],
         comparison=comparison,
         test_metrics=evaluate_by_source(test_rankings, test),
         valid_metrics=evaluate_by_source(valid_rankings, valid),

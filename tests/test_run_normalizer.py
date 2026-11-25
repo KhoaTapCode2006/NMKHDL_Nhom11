@@ -3,7 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.run_normalizer import normalize_publications
+from src.parser.pipeline import ParsingPipeline
+
+normalize_publications = ParsingPipeline.normalize_source
 
 
 class RunNormalizerTests(unittest.TestCase):

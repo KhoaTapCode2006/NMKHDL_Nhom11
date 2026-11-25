@@ -5,8 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.parser.pipeline import ParsingPipeline
-from src.run_parser import main
+from src.parser.pipeline import ParsingPipeline, main
 
 
 class RunParserTests(unittest.TestCase):
