@@ -594,6 +594,85 @@ class ArxivCrawlerTests(unittest.TestCase):
                 ["2510.00001", "2510.00002", "2510.00009"],
             )
 
+    def test_download_source_uses_persistent_keep_alive_session(self):
+        ok_resp = Mock(status_code=200, content=b"%PDF-1.7 ok", headers={}, reason="OK")
+        not_found_resp = Mock(status_code=404, content=b"", headers={}, reason="Not Found")
+        crawler_common.reset_arxiv_pacer()
+        with patch.object(crawler_common.time, "sleep"), patch.object(
+            crawler_common._ARXIV_SESSION, "get", side_effect=[ok_resp, not_found_resp]
+        ) as session_get:
+            res_ok = crawler_common.download_source("2510.00001v1", delay=0.0)
+            res_404 = crawler_common.download_source("2510.00002v1", delay=0.0)
+        crawler_common.reset_arxiv_pacer()
+
+        self.assertTrue(res_ok.succeeded)
+        self.assertEqual(res_ok.data, b"%PDF-1.7 ok")
+        self.assertTrue(res_404.not_found)
+        self.assertEqual(session_get.call_count, 2)
+
+    def test_fetch_references_uses_persistent_s2_session(self):
+        resp = Mock(status_code=200, headers={})
+        resp.json.return_value = {"references": [{"title": "KeepAliveRef"}]}
+        with patch.object(crawler_common._S2_SESSION, "get", return_value=resp) as s2_get:
+            refs, status = crawler_common.fetch_references("2510.12345")
+
+        self.assertEqual(status, "success")
+        self.assertEqual(refs, [{"title": "KeepAliveRef"}])
+        s2_get.assert_called_once()
+
+    def test_crawl_does_not_block_arxiv_when_s2_is_slow_and_attaches_late_references(self):
+        import threading
+
+        release_s2 = threading.Event()
+        arxiv_done = threading.Event()
+
+        paper = SimpleNamespace(
+            **{**vars(self.paper), "entry_id": "http://arxiv.org/abs/2510.00005v1"}
+        )
+
+        def slow_fetch(paper_id):
+            # S2 only finishes AFTER arXiv source download has already completed!
+            self.assertTrue(arxiv_done.wait(timeout=5.0), "arXiv was blocked waiting for S2!")
+            release_s2.wait(timeout=5.0)
+            return [{"title": "LateRef", "externalIds": {"ArXiv": "2401.00001"}}], "success"
+
+        def fake_download(versioned_id, **_kwargs):
+            return crawler_common.DownloadResult(
+                data=make_tar([("main.tex", "\\documentclass{article}\\begin{document}Hi.\\end{document}")]),
+                seconds=0.1,
+            )
+
+        orig_get_source = arxiv_crawler.get_source
+
+        def track_get_source(*args, **kwargs):
+            res = orig_get_source(*args, **kwargs)
+            arxiv_done.set()
+            release_s2.set()
+            return res
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            arxiv_crawler, "discover_papers", return_value=({"2510.00005": paper}, [])
+        ), patch.object(
+            arxiv_crawler, "fetch_version_dates", return_value={"2510.00005": {1: "2025-01-02T00:00:00"}}
+        ), patch.object(
+            crawler_common, "download_source", side_effect=fake_download
+        ), patch.object(
+            arxiv_crawler, "get_source", side_effect=track_get_source
+        ), patch.object(
+            crawler_common, "fetch_references", side_effect=slow_fetch
+        ), patch("builtins.print"):
+            log = arxiv_crawler.crawl(["2510.00005"], save_dir=temp_dir, with_refs=True)
+            v1 = Path(temp_dir) / "2510.00005" / "v1"
+            saved_refs = json.loads((v1 / "references.json").read_text(encoding="utf-8"))
+            meta = json.loads((v1 / "metadata.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(saved_refs), 1)
+        self.assertEqual(saved_refs[0]["title"], "LateRef")
+        self.assertEqual(meta["references_status"], "success")
+        self.assertEqual(meta["references_count"], 1)
+        self.assertEqual(meta["arxiv_references_count"], 1)
+        self.assertEqual(log["papers"]["2510.00005"]["references_status"], "success")
+
 
 if __name__ == "__main__":
     unittest.main()
