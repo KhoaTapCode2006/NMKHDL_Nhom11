@@ -134,24 +134,52 @@ def reset_arxiv_pacer() -> None:
         _arxiv_next_start = 0.0
 
 
+_ORIGINAL_URLOPEN = urllib.request.urlopen
+_ORIGINAL_REQUESTS_GET = requests.get
+_ARXIV_SESSION = requests.Session()
+_ARXIV_SESSION.headers.update({"User-Agent": USER_AGENT})
+_S2_SESSION = requests.Session()
+_S2_SESSION.headers.update({"User-Agent": USER_AGENT})
+
+
 def download_source(
     versioned_id: str,
     retries: int = SOURCE_MAX_RETRIES,
     delay: float = SOURCE_REQUEST_DELAY,
 ) -> DownloadResult:
-    """Download the source archive of one version, e.g. ``2510.10788v2``."""
-    request = urllib.request.Request(
-        SRC_URL + versioned_id, headers={"User-Agent": USER_AGENT}
-    )
+    """Download the source archive of one version, e.g. ``2510.10788v2``.
+
+    Uses a persistent ``requests.Session`` (HTTP Keep-Alive) so successive
+    requests reuse the same single TCP/TLS connection to ``export.arxiv.org``
+    without repeating handshakes. Falls back to ``urllib.request.urlopen`` if a
+    caller/test monkeypatches it.
+    """
+    url = SRC_URL + versioned_id
+    headers = {"User-Agent": USER_AGENT}
+    use_urllib = urllib.request.urlopen is not _ORIGINAL_URLOPEN
     error: Optional[str] = None
     for attempt in range(retries):
         retry_after = 0.0
         wait_for_arxiv_slot(delay)
         started = time.monotonic()
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                data = response.read()
-            return DownloadResult(data=data, seconds=time.monotonic() - started)
+            if use_urllib:
+                request = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(request, timeout=120) as response:
+                    data = response.read()
+                return DownloadResult(data=data, seconds=time.monotonic() - started)
+
+            response = _ARXIV_SESSION.get(url, headers=headers, timeout=120)
+            elapsed = time.monotonic() - started
+            if response.status_code == 404:
+                return DownloadResult(not_found=True, seconds=elapsed)
+            if response.status_code >= 400:
+                error = f"HTTP {response.status_code}: {response.reason}"
+                if response.status_code not in RETRYABLE_HTTP_CODES:
+                    return DownloadResult(error=error, seconds=elapsed)
+                retry_after = _retry_after_header(response.headers.get("Retry-After"))
+            else:
+                return DownloadResult(data=response.content, seconds=elapsed)
         except http.client.IncompleteRead as exc:
             error = f"IncompleteRead: {exc}"
         except urllib.error.HTTPError as exc:
@@ -161,8 +189,8 @@ def download_source(
             error = f"HTTP {exc.code}: {exc.reason}"
             if exc.code not in RETRYABLE_HTTP_CODES:
                 return DownloadResult(error=error, seconds=elapsed)
-            headers = exc.headers or {}
-            retry_after = _retry_after_header(headers.get("Retry-After"))
+            headers_err = exc.headers or {}
+            retry_after = _retry_after_header(headers_err.get("Retry-After"))
         except Exception as exc:  # timeouts, connection resets, DNS errors
             error = f"{type(exc).__name__}: {exc}"
 
@@ -493,10 +521,11 @@ def fetch_references(arxiv_id: str) -> Tuple[Optional[list], str]:
         headers["x-api-key"] = API_KEY
     retry_delay = 0.0
 
+    http_get = requests.get if requests.get is not _ORIGINAL_REQUESTS_GET else _S2_SESSION.get
     for attempt in range(REFERENCE_MAX_RETRIES):
         _wait_for_reference_request(retry_delay)
         try:
-            response = requests.get(url, params=params, headers=headers, timeout=30)
+            response = http_get(url, params=params, headers=headers, timeout=30)
         except requests.RequestException as exc:
             if attempt + 1 == REFERENCE_MAX_RETRIES:
                 print(f"[S2] {base_id}: giving up after {type(exc).__name__}")
@@ -608,6 +637,15 @@ class ReferencePrefetcher:
 
     def has(self, paper_id: str) -> bool:
         return paper_id in self._queued
+
+    def try_get(self, paper_id: str) -> Optional[Tuple[Optional[list], str]]:
+        """Return ``(references, status)`` immediately if ready, else ``None``."""
+        with self._condition:
+            if paper_id not in self._results:
+                return None
+            result = self._results.pop(paper_id)
+        self._slots.release()
+        return result
 
     def get(self, paper_id: str) -> Tuple[Optional[list], str]:
         with self._condition:

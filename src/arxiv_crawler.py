@@ -271,7 +271,7 @@ def start_reference_prefetcher(
     papers: Iterable,
     save_dir: str | Path = DEFAULT_OUTPUT_DIR,
     with_refs: bool = True,
-    lookahead: int = 25,
+    lookahead: int = 5000,
 ) -> Optional[common.ReferencePrefetcher]:
     """Start fetching the references of the papers that need them, in crawl order."""
     if not with_refs:
@@ -286,11 +286,15 @@ def crawl_paper(
     with_refs: bool = True,
     version_dates: Optional[Dict[int, str]] = None,
     prefetcher: Optional[common.ReferencePrefetcher] = None,
+    wait_for_refs: bool = True,
 ) -> dict:
     """Fetch references once, then download every version ``v1..vN``.
 
-    With a ``prefetcher`` the references were requested in the background while
-    earlier papers were downloading; without one they are requested here.
+    With a ``prefetcher`` the references are requested in the background while
+    arXiv sources download. When ``wait_for_refs`` is ``False`` (used by
+    ``crawl()``), arXiv downloads never block waiting for Semantic Scholar:
+    if a paper's references are not ready yet, the sources download immediately
+    and ``crawl()`` attaches the references as soon as the prefetcher finishes.
     """
     base_id, latest = latest_version_of(paper)
     paper_dir = Path(save_dir) / common.paper_folder_name(base_id)
@@ -303,10 +307,19 @@ def crawl_paper(
         print(f"  {base_id}: all {latest} versions already downloaded")
         return {"base_id": base_id, "versions": latest, "results": [], "skipped": True}
 
+    references_pending = False
     if references is None and with_refs:
         try:
             if prefetcher is not None and prefetcher.has(base_id):
-                references, ref_status = prefetcher.get(base_id)
+                if not wait_for_refs and hasattr(prefetcher, "try_get"):
+                    ready = prefetcher.try_get(base_id)
+                    if ready is not None:
+                        references, ref_status = ready
+                    else:
+                        references, ref_status = None, "pending"
+                        references_pending = True
+                else:
+                    references, ref_status = prefetcher.get(base_id)
             else:
                 references, ref_status = fetch_references(base_id)
         except Exception as exc:  # one paper must never stop the crawl
@@ -316,6 +329,16 @@ def crawl_paper(
         ref_status = "skipped"
 
     if sources_done:
+        if references_pending:
+            print(f"  {base_id}: sources already downloaded; waiting for S2 in background")
+            return {
+                "base_id": base_id,
+                "versions": latest,
+                "references_status": "pending",
+                "references_pending": True,
+                "results": [],
+                "skipped": False,
+            }
         # Only the references were missing: attach them, no source to download.
         if references is not None:
             attach_references(paper_dir, latest, references, ref_status)
@@ -345,9 +368,29 @@ def crawl_paper(
         "base_id": base_id,
         "versions": latest,
         "references_status": ref_status,
+        "references_pending": references_pending,
         "results": results,
         "skipped": False,
     }
+
+
+def _flush_pending_references(
+    pending_refs: Dict[str, Tuple[Path, int]],
+    prefetcher: common.ReferencePrefetcher,
+    log_papers: Dict[str, dict],
+    block: bool = False,
+) -> None:
+    """Attach background Semantic Scholar results as they become available."""
+    for pid in list(pending_refs):
+        ready = prefetcher.get(pid) if block else prefetcher.try_get(pid)
+        if ready is None:
+            continue
+        paper_dir, latest = pending_refs.pop(pid)
+        refs, status = ready
+        if refs is not None:
+            attach_references(paper_dir, latest, refs, status)
+        if pid in log_papers:
+            log_papers[pid]["references_status"] = status
 
 
 def crawl(
@@ -367,18 +410,34 @@ def crawl(
     log = {"requested": len(ids), "resolved": len(papers), "missing_ids": missing, "papers": {}}
     ordered = [papers[i] for i in ids if i in papers]
     prefetcher = start_reference_prefetcher(ordered, save_dir, with_refs)
+    pending_refs: Dict[str, Tuple[Path, int]] = {}
     try:
         for base_id in ids:
             if base_id not in papers:
                 continue
             result = crawl_paper(
-                papers[base_id], save_dir, with_refs, dates.get(base_id), prefetcher
+                papers[base_id],
+                save_dir,
+                with_refs,
+                dates.get(base_id),
+                prefetcher,
+                wait_for_refs=False,
             )
             log["papers"][base_id] = {
                 "versions": result["versions"],
                 "references_status": result.get("references_status"),
                 "statuses": [r.get("source_status") for r in result["results"]],
             }
+            if result.get("references_pending"):
+                pending_refs[base_id] = (
+                    save_dir / common.paper_folder_name(base_id),
+                    result["versions"],
+                )
+            if prefetcher is not None and pending_refs:
+                _flush_pending_references(pending_refs, prefetcher, log["papers"], block=False)
+        if prefetcher is not None and pending_refs:
+            print(f"[S2] Waiting for {len(pending_refs)} remaining background reference lookups...")
+            _flush_pending_references(pending_refs, prefetcher, log["papers"], block=True)
     finally:
         if prefetcher is not None:
             prefetcher.stop()
