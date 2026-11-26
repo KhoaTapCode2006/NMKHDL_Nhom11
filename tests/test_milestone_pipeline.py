@@ -495,6 +495,64 @@ class MilestonePipelineOptimizationTests(unittest.TestCase):
                 self.assertTrue(list((dataset_dir / "data" / name).glob("*.parquet")))
             self.assertFalse((dataset_dir / "data" / "predictions").exists())
 
+    def test_filter_selected_ids_filters_all_six_tables_including_predictions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            dataset_dir = root / "hf_filtered"
+            match_dir = root / "matching_out"
+            match_dir.mkdir(parents=True)
+
+            _write_sample_crawled_and_parsed_pub(src, "2407.17839")
+            _write_sample_crawled_and_parsed_pub(src, "2506.10788")
+
+            pd.DataFrame(
+                [
+                    {
+                        "arxiv_id": "2407.17839",
+                        "partition": "test",
+                        "citation_key": "vaswani2017",
+                        "groundtruth_arxiv_id": "1706.03762",
+                        "cand_1": "1706.03762",
+                        "cand_2": None,
+                        "cand_3": None,
+                        "cand_4": None,
+                        "cand_5": None,
+                    },
+                    {
+                        "arxiv_id": "2506.10788",
+                        "partition": "train",
+                        "citation_key": "vaswani2017",
+                        "groundtruth_arxiv_id": "1706.03762",
+                        "cand_1": "1706.03762",
+                        "cand_2": None,
+                        "cand_3": None,
+                        "cand_4": None,
+                        "cand_5": None,
+                    },
+                ]
+            ).to_parquet(match_dir / "predictions.parquet", index=False)
+
+            rc = milestone_pipeline.main(
+                [
+                    "--export-only",
+                    "--ids",
+                    "2407.17839",
+                    "--filter-selected-ids",
+                    "--source-dir",
+                    str(src),
+                    "--matching-output-dir",
+                    str(match_dir),
+                    "--dataset-dir",
+                    str(dataset_dir),
+                ]
+            )
+            self.assertEqual(rc, 0)
+
+            for table_name in milestone_pipeline.TABLE_SCHEMAS:
+                df = pq.read_table(dataset_dir / "data" / table_name).to_pandas()
+                self.assertEqual(sorted(df["arxiv_id"].unique().tolist()), ["2407.17839"])
+
 
 if __name__ == "__main__":
     unittest.main()
