@@ -418,6 +418,7 @@ def export_predictions(
     matching_output_dir: Path,
     dataset_dir: Path,
     shard_rows: int = DEFAULT_SHARD_ROWS,
+    allowed_ids: Optional[Set[str]] = None,
 ) -> None:
     predictions_path = matching_output_dir / "predictions.parquet"
     if not predictions_path.is_file():
@@ -429,15 +430,18 @@ def export_predictions(
         raise ValueError(
             f"Matching predictions are missing columns: {', '.join(missing_columns)}"
         )
-    rows = predictions[required].where(pd.notna(predictions[required]), None).to_dict(
-        orient="records"
-    )
-    for row in rows:
+    filtered_rows: List[dict] = []
+    for row in predictions[required].to_dict(orient="records"):
         for column in required:
-            if row[column] is not None:
-                row[column] = str(row[column])
+            val = row.get(column)
+            row[column] = None if (val is None or pd.isna(val)) else str(val)
         row["arxiv_id"] = _canonical_pub_id(row["arxiv_id"])
-    _write_sharded_table(dataset_dir, "predictions", rows, shard_rows=shard_rows)
+        if allowed_ids is not None and row["arxiv_id"] not in allowed_ids:
+            continue
+        filtered_rows.append(row)
+    _write_sharded_table(
+        dataset_dir, "predictions", filtered_rows, shard_rows=shard_rows
+    )
 
 
 def write_dataset_card(
@@ -619,7 +623,10 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         )
         if "export" in stages:
             export_predictions(
-                matching_output_dir, dataset_dir, shard_rows=shard_rows
+                matching_output_dir,
+                dataset_dir,
+                shard_rows=shard_rows,
+                allowed_ids=allowed_ids,
             )
             exported_match = True
 
@@ -655,7 +662,10 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             predictions_file = matching_output_dir / "predictions.parquet"
             if predictions_file.is_file():
                 export_predictions(
-                    matching_output_dir, dataset_dir, shard_rows=shard_rows
+                    matching_output_dir,
+                    dataset_dir,
+                    shard_rows=shard_rows,
+                    allowed_ids=allowed_ids,
                 )
         write_dataset_card(dataset_dir)
 
